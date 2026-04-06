@@ -11,6 +11,7 @@ import { CreateAppForm } from "@/components/CreateAppForm";
 import { AppDetailsPage } from "@/components/AppDetailsPage";
 import { GitHubPage } from "@/components/GitHubPage";
 import { UsagePage } from "@/components/UsagePage";
+import { SettingsPage } from "@/components/SettingsPage";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 
