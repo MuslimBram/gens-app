@@ -40,6 +40,7 @@ function AuthenticatedRoutes() {
         <Route path="/:id" element={<AppDetailsPage />} />
         <Route path="/github" element={<GitHubPage />} />
         <Route path="/usage" element={<UsagePage />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>
   );

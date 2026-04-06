@@ -156,6 +156,43 @@ serve(async (req) => {
     const body = await req.json();
     const { action } = body;
 
+    // Prompt moderation for generation actions
+    if (action === "create_spec" || action === "follow_up_edit") {
+      const prompt = body.prompt || "";
+      const blockedPatterns = [
+        /\b(hack|exploit|malware|trojan|virus|keylog|phish|ransomware)\b/i,
+        /\b(steal|scrape\s+personal|harvest\s+email|ddos|brute\s*force)\b/i,
+        /\b(credit\s*card\s*skim|password\s*steal|identity\s*theft)\b/i,
+        /\b(deepfake|revenge\s*porn|child\s*exploit)\b/i,
+      ];
+      for (const pattern of blockedPatterns) {
+        if (pattern.test(prompt)) {
+          return new Response(JSON.stringify({ error: "Your prompt violates our usage policy. Please rephrase." }), {
+            status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+      }
+      if (prompt.trim().length < 3) {
+        return new Response(JSON.stringify({ error: "Prompt is too short (min 3 characters)." }), {
+          status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // Quota enforcement
+    if (action === "create_spec" || action === "follow_up_edit" || action === "export") {
+      const quotaType = action === "create_spec" ? "generation" : action === "follow_up_edit" ? "follow_up" : "export";
+      const { data: allowed } = await supabase.rpc("check_and_increment_quota", {
+        p_user_id: user.id,
+        p_action_type: quotaType,
+      });
+      if (allowed === false) {
+        return new Response(JSON.stringify({ error: `Quota exceeded for ${quotaType}. Upgrade your plan for more.` }), {
+          status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
     // ACTION: CREATE SPEC
     if (action === "create_spec") {
       const { projectId, prompt, model, template, stack, appType, options } = body;
