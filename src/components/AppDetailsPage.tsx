@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useProject, useProjectFiles, useProjectGenerations, useProjectRevisions, useBuildLogs, useUpdateProject, useDeleteProject } from '@/hooks/useProjects';
 import { followUpEdit, exportZip, exportDesktop, exportMobile, exportPWA } from '@/lib/ai-service';
+import { pushToGitHub } from '@/lib/github-service';
 import { PROJECT_STATUSES, TEMPLATES, STACKS, AI_MODELS } from '@/lib/constants';
 import { supabase } from '@/integrations/supabase/client';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -13,10 +14,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from 'sonner';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   FileCode, FolderTree, GitBranch, History, Terminal, Eye, Download,
   Loader2, Send, ArrowLeft, Trash2, Monitor, Smartphone, Globe,
-  ChevronRight, File, Folder
+  ChevronRight, File, Folder, RotateCcw, ArrowLeftRight
 } from 'lucide-react';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -27,6 +29,7 @@ import { formatDistanceToNow } from 'date-fns';
 export function AppDetailsPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { data: project, isLoading } = useProject(id);
   const { data: files } = useProjectFiles(id);
   const { data: generations } = useProjectGenerations(id);
@@ -40,6 +43,9 @@ export function AppDetailsPage() {
   const [followUpModel, setFollowUpModel] = useState('auto');
   const [isEditing, setIsEditing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
+  const [compareRevisions, setCompareRevisions] = useState<{ a: string; b: string } | null>(null);
+  const [compareFiles, setCompareFiles] = useState<{ a: any[]; b: any[] } | null>(null);
 
   if (isLoading) {
     return <div className="space-y-4"><Skeleton className="h-8 w-48" /><Skeleton className="h-64" /></div>;
@@ -58,8 +64,6 @@ export function AppDetailsPage() {
   const template = TEMPLATES.find((t) => t.key === project.template_key);
   const stack = STACKS.find((s) => s.key === project.stack_key);
   const selectedFileData = files?.find((f) => f.path === selectedFile);
-
-  // Build file tree structure
   const fileTree = buildFileTree(files || []);
 
   const handleFollowUp = async () => {
@@ -71,6 +75,8 @@ export function AppDetailsPage() {
       await followUpEdit(id, lastGen.id, followUpPrompt, followUpModel);
       toast.success('Project updated!');
       setFollowUpPrompt('');
+      queryClient.invalidateQueries({ queryKey: ['project-files', id] });
+      queryClient.invalidateQueries({ queryKey: ['project-revisions', id] });
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -100,6 +106,75 @@ export function AppDetailsPage() {
   const handleDelete = async () => {
     await deleteProject.mutateAsync(project.id);
     navigate('/app-builder');
+  };
+
+  const handleRestoreRevision = async (revisionId: string, revisionNumber: number) => {
+    if (!id) return;
+    setIsRestoring(true);
+    try {
+      // Get files for this revision
+      const { data: revFiles, error } = await supabase
+        .from('app_files')
+        .select('path, content, file_type')
+        .eq('project_id', id)
+        .eq('revision_id', revisionId);
+
+      if (error) throw error;
+      if (!revFiles || revFiles.length === 0) {
+        toast.error('No files found for this revision');
+        return;
+      }
+
+      // Create a new revision for the restore
+      const { count } = await supabase.from('app_revisions')
+        .select('*', { count: 'exact', head: true }).eq('project_id', id);
+
+      await supabase.from('app_revisions').insert({
+        project_id: id,
+        revision_number: (count || 0) + 1,
+        change_summary: `Restored to revision #${revisionNumber}`,
+        created_by: (await supabase.auth.getUser()).data.user!.id,
+      });
+
+      // Update current files with revision's files
+      for (const file of revFiles) {
+        await supabase.from('app_files')
+          .update({ content: file.content })
+          .eq('project_id', id)
+          .eq('path', file.path);
+      }
+
+      toast.success(`Restored to revision #${revisionNumber}`);
+      queryClient.invalidateQueries({ queryKey: ['project-files', id] });
+      queryClient.invalidateQueries({ queryKey: ['project-revisions', id] });
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setIsRestoring(false);
+    }
+  };
+
+  const handleCompareRevisions = async (revAId: string, revBId: string) => {
+    try {
+      const [{ data: filesA }, { data: filesB }] = await Promise.all([
+        supabase.from('app_files').select('path, content').eq('project_id', id!).eq('revision_id', revAId),
+        supabase.from('app_files').select('path, content').eq('project_id', id!).eq('revision_id', revBId),
+      ]);
+      setCompareRevisions({ a: revAId, b: revBId });
+      setCompareFiles({ a: filesA || [], b: filesB || [] });
+    } catch (err: any) {
+      toast.error(err.message);
+    }
+  };
+
+  const handlePushGitHub = async () => {
+    if (!id) return;
+    try {
+      const result = await pushToGitHub(id);
+      toast.success(`Pushed ${result.filesCount} files to ${result.repo}`);
+    } catch (err: any) {
+      toast.error(err.message);
+    }
   };
 
   return (
@@ -157,7 +232,6 @@ export function AppDetailsPage() {
         {/* Files Tab */}
         <TabsContent value="files">
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* File tree */}
             <Card className="shadow-card">
               <CardHeader className="py-3 px-4"><CardTitle className="text-sm">File Tree</CardTitle></CardHeader>
               <CardContent className="p-0">
@@ -170,8 +244,6 @@ export function AppDetailsPage() {
                 </ScrollArea>
               </CardContent>
             </Card>
-
-            {/* Code viewer */}
             <Card className="lg:col-span-2 shadow-card">
               <CardHeader className="py-3 px-4">
                 <CardTitle className="text-sm flex items-center gap-2">
@@ -194,18 +266,12 @@ export function AppDetailsPage() {
               </CardContent>
             </Card>
           </div>
-
-          {/* Follow-up edit */}
           <Card className="shadow-card mt-4">
             <CardContent className="p-4">
               <div className="flex gap-3">
                 <div className="flex-1">
-                  <Textarea
-                    value={followUpPrompt}
-                    onChange={(e) => setFollowUpPrompt(e.target.value)}
-                    placeholder="Describe changes: add login, redesign dashboard, fix bugs..."
-                    className="min-h-[60px]"
-                  />
+                  <Textarea value={followUpPrompt} onChange={(e) => setFollowUpPrompt(e.target.value)}
+                    placeholder="Describe changes: add login, redesign dashboard, fix bugs..." className="min-h-[60px]" />
                 </div>
                 <div className="flex flex-col gap-2">
                   <Select value={followUpModel} onValueChange={setFollowUpModel}>
@@ -248,21 +314,16 @@ export function AppDetailsPage() {
                       <div className="text-xs text-muted-foreground">Stack</div>
                     </div>
                   </div>
-
                   <h3 className="font-semibold text-foreground mt-4">Generated Pages</h3>
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                     {files.filter(f => f.path.includes('pages/') || f.path.endsWith('.html')).map(f => (
-                      <button
-                        key={f.id}
-                        onClick={() => { setSelectedFile(f.path); }}
-                        className="p-3 rounded-lg border text-left hover:border-primary/50 transition-colors"
-                      >
+                      <button key={f.id} onClick={() => setSelectedFile(f.path)}
+                        className="p-3 rounded-lg border text-left hover:border-primary/50 transition-colors">
                         <div className="text-sm font-medium text-foreground">{f.path.split('/').pop()}</div>
                         <div className="text-xs text-muted-foreground">{f.path}</div>
                       </button>
                     ))}
                   </div>
-
                   {generations?.[0]?.spec_json && (
                     <div className="mt-4">
                       <h3 className="font-semibold text-foreground mb-2">Project Spec</h3>
@@ -284,31 +345,101 @@ export function AppDetailsPage() {
 
         {/* Revisions Tab */}
         <TabsContent value="revisions">
-          <Card className="shadow-card">
-            <CardContent className="p-4">
-              {revisions && revisions.length > 0 ? (
-                <div className="space-y-3">
-                  {revisions.map((rev) => (
-                    <div key={rev.id} className="flex items-center justify-between p-3 rounded-lg border">
-                      <div>
-                        <div className="font-medium text-sm text-foreground">Revision #{rev.revision_number}</div>
-                        <div className="text-xs text-muted-foreground">{rev.change_summary || 'No summary'}</div>
-                        <div className="text-xs text-muted-foreground mt-1">
-                          {formatDistanceToNow(new Date(rev.created_at), { addSuffix: true })}
+          {compareFiles ? (
+            <Card className="shadow-card">
+              <CardHeader className="py-3 px-4 flex flex-row items-center justify-between">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <ArrowLeftRight className="w-4 h-4" /> Revision Comparison
+                </CardTitle>
+                <Button variant="ghost" size="sm" onClick={() => { setCompareFiles(null); setCompareRevisions(null); }}>
+                  Close
+                </Button>
+              </CardHeader>
+              <CardContent className="p-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <h4 className="text-xs font-medium text-muted-foreground mb-2">Older ({compareFiles.a.length} files)</h4>
+                    <div className="space-y-1 max-h-[400px] overflow-auto">
+                      {compareFiles.a.map((f, i) => {
+                        const matchB = compareFiles.b.find(fb => fb.path === f.path);
+                        const changed = matchB && matchB.content !== f.content;
+                        const removed = !matchB;
+                        return (
+                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${removed ? 'bg-destructive/10 text-destructive' : changed ? 'bg-warning/10 text-warning' : 'text-muted-foreground'}`}>
+                            {f.path} {removed ? '(removed)' : changed ? '(changed)' : ''}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-medium text-muted-foreground mb-2">Newer ({compareFiles.b.length} files)</h4>
+                    <div className="space-y-1 max-h-[400px] overflow-auto">
+                      {compareFiles.b.map((f, i) => {
+                        const matchA = compareFiles.a.find(fa => fa.path === f.path);
+                        const isNew = !matchA;
+                        const changed = matchA && matchA.content !== f.content;
+                        return (
+                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${isNew ? 'bg-success/10 text-success' : changed ? 'bg-warning/10 text-warning' : 'text-muted-foreground'}`}>
+                            {f.path} {isNew ? '(new)' : changed ? '(changed)' : ''}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="shadow-card">
+              <CardContent className="p-4">
+                {revisions && revisions.length > 0 ? (
+                  <div className="space-y-3">
+                    {revisions.map((rev, idx) => (
+                      <div key={rev.id} className="flex items-center justify-between p-3 rounded-lg border">
+                        <div>
+                          <div className="font-medium text-sm text-foreground">Revision #{rev.revision_number}</div>
+                          <div className="text-xs text-muted-foreground">{rev.change_summary || 'No summary'}</div>
+                          <div className="text-xs text-muted-foreground mt-1">
+                            {formatDistanceToNow(new Date(rev.created_at), { addSuffix: true })}
+                          </div>
+                        </div>
+                        <div className="flex gap-2">
+                          {idx < revisions.length - 1 && (
+                            <Button variant="outline" size="sm" onClick={() => handleCompareRevisions(revisions[idx + 1].id, rev.id)}>
+                              <ArrowLeftRight className="w-3 h-3 mr-1" /> Compare
+                            </Button>
+                          )}
+                          <AlertDialog>
+                            <AlertDialogTrigger asChild>
+                              <Button variant="outline" size="sm" disabled={isRestoring}>
+                                <RotateCcw className="w-3 h-3 mr-1" /> Restore
+                              </Button>
+                            </AlertDialogTrigger>
+                            <AlertDialogContent>
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>Restore revision #{rev.revision_number}?</AlertDialogTitle>
+                                <AlertDialogDescription>This will restore all files to this revision's state and create a new revision.</AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                <AlertDialogAction onClick={() => handleRestoreRevision(rev.id, rev.revision_number)}>Restore</AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
                         </div>
                       </div>
-                      <Button variant="outline" size="sm">Restore</Button>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-12">
-                  <History className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
-                  <p className="text-muted-foreground">No revisions yet</p>
-                </div>
-              )}
-            </CardContent>
-          </Card>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-center py-12">
+                    <History className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
+                    <p className="text-muted-foreground">No revisions yet</p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
         </TabsContent>
 
         {/* Build Logs Tab */}
@@ -360,7 +491,6 @@ export function AppDetailsPage() {
                 </Button>
               </CardContent>
             </Card>
-
             <Card className="shadow-card">
               <CardContent className="p-5">
                 <div className="flex items-center gap-3 mb-3">
@@ -371,16 +501,11 @@ export function AppDetailsPage() {
                   </div>
                 </div>
                 <div className="flex gap-2">
-                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'mac').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>
-                    macOS
-                  </Button>
-                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'windows').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>
-                    Windows
-                  </Button>
+                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'mac').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>macOS</Button>
+                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'windows').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>Windows</Button>
                 </div>
               </CardContent>
             </Card>
-
             <Card className="shadow-card">
               <CardContent className="p-5">
                 <div className="flex items-center gap-3 mb-3">
@@ -391,16 +516,11 @@ export function AppDetailsPage() {
                   </div>
                 </div>
                 <div className="flex gap-2">
-                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'android').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>
-                    Android
-                  </Button>
-                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'ios').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>
-                    iOS
-                  </Button>
+                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'android').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>Android</Button>
+                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'ios').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>iOS</Button>
                 </div>
               </CardContent>
             </Card>
-
             <Card className="shadow-card">
               <CardContent className="p-5">
                 <div className="flex items-center gap-3 mb-3">
@@ -434,7 +554,7 @@ export function AppDetailsPage() {
                     </a>
                   )}
                   <div className="flex gap-2">
-                    <Button variant="outline">Push Changes</Button>
+                    <Button variant="outline" onClick={handlePushGitHub}>Push Changes</Button>
                     <Button variant="outline">Create Branch</Button>
                   </div>
                 </div>
@@ -443,8 +563,8 @@ export function AppDetailsPage() {
                   <GitBranch className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
                   <h3 className="font-semibold text-foreground mb-2">Connect to GitHub</h3>
                   <p className="text-sm text-muted-foreground mb-4">Push your generated code to a GitHub repository</p>
-                  <Button className="gap-2">
-                    <GitBranch className="w-4 h-4" /> Connect GitHub
+                  <Button className="gap-2" onClick={() => navigate('/app-builder/github')}>
+                    <GitBranch className="w-4 h-4" /> Go to GitHub Settings
                   </Button>
                 </div>
               )}

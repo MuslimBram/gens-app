@@ -112,6 +112,23 @@ async function callAIJSON(prompt: string, systemPrompt: string, model: string): 
   throw new Error("Failed to get structured output");
 }
 
+// Rate limiting: in-memory store
+const genRateLimits = new Map<string, { count: number; resetAt: number }>();
+const GEN_RATE_LIMIT = 20;
+const GEN_RATE_WINDOW = 60_000;
+
+function checkGenRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const entry = genRateLimits.get(userId);
+  if (!entry || now > entry.resetAt) {
+    genRateLimits.set(userId, { count: 1, resetAt: now + GEN_RATE_WINDOW });
+    return true;
+  }
+  if (entry.count >= GEN_RATE_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -127,6 +144,12 @@ serve(async (req) => {
     if (authError || !user) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (!checkGenRateLimit(user.id)) {
+      return new Response(JSON.stringify({ error: "Rate limited. Max 20 requests per minute." }), {
+        status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
