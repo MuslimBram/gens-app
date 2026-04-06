@@ -55,6 +55,12 @@ export function CreateAppForm() {
       return;
     }
 
+    const modResult = moderatePrompt(form.description);
+    if (!modResult.safe) {
+      toast.error(modResult.reason || 'Invalid prompt');
+      return;
+    }
+
     setGenerating(true);
     try {
       // Step 1: Create project
