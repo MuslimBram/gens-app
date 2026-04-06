@@ -1,13 +1,14 @@
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
 import { Button } from '@/components/ui/button';
-import { Zap, LayoutGrid, PlusCircle, GitBranch, BarChart3, LogOut } from 'lucide-react';
+import { Zap, LayoutGrid, PlusCircle, GitBranch, BarChart3, Settings, LogOut } from 'lucide-react';
 
 const navItems = [
   { to: '/app-builder', label: 'My Apps', icon: LayoutGrid },
   { to: '/app-builder/create', label: 'Create App', icon: PlusCircle },
   { to: '/app-builder/github', label: 'GitHub', icon: GitBranch },
   { to: '/app-builder/usage', label: 'Usage', icon: BarChart3 },
+  { to: '/app-builder/settings', label: 'Settings', icon: Settings },
 ];
 
 export function AppLayout({ children }: { children: React.ReactNode }) {

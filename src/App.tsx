@@ -11,6 +11,7 @@ import { CreateAppForm } from "@/components/CreateAppForm";
 import { AppDetailsPage } from "@/components/AppDetailsPage";
 import { GitHubPage } from "@/components/GitHubPage";
 import { UsagePage } from "@/components/UsagePage";
+import { SettingsPage } from "@/components/SettingsPage";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 
@@ -39,6 +40,7 @@ function AuthenticatedRoutes() {
         <Route path="/:id" element={<AppDetailsPage />} />
         <Route path="/github" element={<GitHubPage />} />
         <Route path="/usage" element={<UsagePage />} />
+        <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>
   );

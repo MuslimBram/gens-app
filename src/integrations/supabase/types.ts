@@ -384,12 +384,63 @@ export type Database = {
           },
         ]
       }
+      user_plans: {
+        Row: {
+          created_at: string
+          exports_limit: number
+          exports_used: number
+          follow_ups_limit: number
+          follow_ups_used: number
+          generations_limit: number
+          generations_used: number
+          id: string
+          period_end: string
+          period_start: string
+          plan_name: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          exports_limit?: number
+          exports_used?: number
+          follow_ups_limit?: number
+          follow_ups_used?: number
+          generations_limit?: number
+          generations_used?: number
+          id?: string
+          period_end?: string
+          period_start?: string
+          plan_name?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          exports_limit?: number
+          exports_used?: number
+          follow_ups_limit?: number
+          follow_ups_used?: number
+          generations_limit?: number
+          generations_used?: number
+          id?: string
+          period_end?: string
+          period_start?: string
+          plan_name?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      check_and_increment_quota: {
+        Args: { p_action_type: string; p_user_id: string }
+        Returns: boolean
+      }
     }
     Enums: {
       app_project_status:
