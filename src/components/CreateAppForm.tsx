@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useCreateProject } from '@/hooks/useProjects';
 import { AI_MODELS, TEMPLATES, STACKS, APP_TYPES } from '@/lib/constants';
 import { generateSpec, generateFiles, reviewFiles, validateProject } from '@/lib/ai-service';
+import { moderatePrompt } from '@/lib/plan-constants';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { Button } from '@/components/ui/button';
