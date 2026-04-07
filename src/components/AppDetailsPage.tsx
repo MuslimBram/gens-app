@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useProject, useProjectFiles, useProjectGenerations, useProjectRevisions, useBuildLogs, useUpdateProject, useDeleteProject } from '@/hooks/useProjects';
-import { followUpEdit, exportZip, exportDesktop, exportMobile, exportPWA } from '@/lib/ai-service';
-import { pushToGitHub } from '@/lib/github-service';
+import { followUpEdit, exportZip, exportDesktop, exportMobile, exportPWA, resumeGeneration } from '@/lib/ai-service';
+import { pushToGitHub, createGitHubRepo, createGitHubBranch } from '@/lib/github-service';
 import { PROJECT_STATUSES, TEMPLATES, STACKS, AI_MODELS } from '@/lib/constants';
 import { supabase } from '@/integrations/supabase/client';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -10,21 +10,81 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   FileCode, FolderTree, GitBranch, History, Terminal, Eye, Download,
   Loader2, Send, ArrowLeft, Trash2, Monitor, Smartphone, Globe,
-  ChevronRight, File, Folder, RotateCcw, ArrowLeftRight
+  ChevronRight, File, Folder, RotateCcw, ArrowLeftRight, Plus, RefreshCw
 } from 'lucide-react';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger
 } from '@/components/ui/alert-dialog';
 import { formatDistanceToNow } from 'date-fns';
+
+// ─── Live Preview: builds an HTML document from generated files ───
+function buildPreviewHtml(files: { path: string; content: string }[]): string {
+  const indexHtml = files.find(f => f.path === 'index.html');
+  if (indexHtml) {
+    // Inline CSS and JS into the HTML
+    let html = indexHtml.content;
+    const cssFiles = files.filter(f => f.path.endsWith('.css'));
+    const jsFiles = files.filter(f => f.path.endsWith('.js') && f.path !== 'electron/main.cjs');
+    const inlineCSS = cssFiles.map(f => `<style>/* ${f.path} */\n${f.content}</style>`).join('\n');
+    const inlineJS = jsFiles.map(f => `<script>/* ${f.path} */\n${f.content}<\/script>`).join('\n');
+    html = html.replace('</head>', `${inlineCSS}\n</head>`);
+    html = html.replace('</body>', `${inlineJS}\n</body>`);
+    return html;
+  }
+
+  // For React/other projects, show a formatted code summary
+  const cssFiles = files.filter(f => f.path.endsWith('.css'));
+  const componentFiles = files.filter(f => f.path.match(/\.(tsx|jsx)$/) && f.path.includes('/'));
+  const pageFiles = files.filter(f => f.path.includes('pages/') || f.path.includes('views/'));
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; padding:24px; }
+  h1 { font-size:20px; margin-bottom:16px; color:#60a5fa; }
+  h2 { font-size:14px; margin:16px 0 8px; color:#94a3b8; text-transform:uppercase; letter-spacing:1px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
+  .card { background:#1e293b; border-radius:8px; padding:12px; border:1px solid #334155; }
+  .card h3 { font-size:13px; color:#f1f5f9; margin-bottom:4px; }
+  .card p { font-size:11px; color:#64748b; word-break:break-all; }
+  .stats { display:flex; gap:16px; margin-bottom:20px; }
+  .stat { background:#1e293b; border-radius:8px; padding:12px 16px; border:1px solid #334155; }
+  .stat .num { font-size:24px; font-weight:bold; color:#60a5fa; }
+  .stat .label { font-size:11px; color:#64748b; }
+  ${cssFiles.map(f => f.content).join('\n')}
+</style></head><body>
+  <h1>📱 Project Preview</h1>
+  <div class="stats">
+    <div class="stat"><div class="num">${files.length}</div><div class="label">Files</div></div>
+    <div class="stat"><div class="num">${pageFiles.length}</div><div class="label">Pages</div></div>
+    <div class="stat"><div class="num">${componentFiles.length}</div><div class="label">Components</div></div>
+  </div>
+  ${pageFiles.length ? `<h2>Pages</h2><div class="grid">${pageFiles.map(f => `<div class="card"><h3>${f.path.split('/').pop()}</h3><p>${f.path}</p></div>`).join('')}</div>` : ''}
+  ${componentFiles.length ? `<h2>Components</h2><div class="grid">${componentFiles.map(f => `<div class="card"><h3>${f.path.split('/').pop()}</h3><p>${f.path}</p></div>`).join('')}</div>` : ''}
+</body></html>`;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export function AppDetailsPage() {
   const { id } = useParams();
@@ -42,10 +102,24 @@ export function AppDetailsPage() {
   const [followUpPrompt, setFollowUpPrompt] = useState('');
   const [followUpModel, setFollowUpModel] = useState('auto');
   const [isEditing, setIsEditing] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
+  const [isExporting, setIsExporting] = useState<string | null>(null);
   const [isRestoring, setIsRestoring] = useState(false);
-  const [compareRevisions, setCompareRevisions] = useState<{ a: string; b: string } | null>(null);
   const [compareFiles, setCompareFiles] = useState<{ a: any[]; b: any[] } | null>(null);
+
+  // GitHub state
+  const [newRepoName, setNewRepoName] = useState('');
+  const [isRepoPrivate, setIsRepoPrivate] = useState(true);
+  const [isCreatingRepo, setIsCreatingRepo] = useState(false);
+  const [pushBranch, setPushBranch] = useState('main');
+  const [isPushing, setIsPushing] = useState(false);
+  const [newBranchName, setNewBranchName] = useState('');
+  const [isCreatingBranch, setIsCreatingBranch] = useState(false);
+
+  // Build preview HTML
+  const previewHtml = useMemo(() => {
+    if (!files?.length) return null;
+    return buildPreviewHtml(files.map(f => ({ path: f.path, content: f.content })));
+  }, [files]);
 
   if (isLoading) {
     return <div className="space-y-4"><Skeleton className="h-8 w-48" /><Skeleton className="h-64" /></div>;
@@ -65,6 +139,8 @@ export function AppDetailsPage() {
   const stack = STACKS.find((s) => s.key === project.stack_key);
   const selectedFileData = files?.find((f) => f.path === selectedFile);
   const fileTree = buildFileTree(files || []);
+  const latestGen = generations?.[0];
+  const canResume = latestGen?.status === 'failed';
 
   const handleFollowUp = async () => {
     if (!followUpPrompt.trim() || !id) return;
@@ -77,6 +153,7 @@ export function AppDetailsPage() {
       setFollowUpPrompt('');
       queryClient.invalidateQueries({ queryKey: ['project-files', id] });
       queryClient.invalidateQueries({ queryKey: ['project-revisions', id] });
+      queryClient.invalidateQueries({ queryKey: ['project-generations', id] });
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -84,22 +161,58 @@ export function AppDetailsPage() {
     }
   };
 
-  const handleExportZip = async () => {
-    if (!id) return;
-    setIsExporting(true);
+  const handleResume = async () => {
+    if (!id || !latestGen) return;
     try {
-      const blob = await exportZip(id);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${project.slug || project.name}.zip`;
-      a.click();
-      URL.revokeObjectURL(url);
-      toast.success('ZIP downloaded!');
+      await resumeGeneration(id, latestGen.id);
+      toast.success('Generation resumed');
+      queryClient.invalidateQueries({ queryKey: ['project-generations', id] });
+    } catch (err: any) {
+      toast.error(err.message);
+    }
+  };
+
+  const handleExport = async (type: string) => {
+    if (!id) return;
+    setIsExporting(type);
+    try {
+      let blob: Blob;
+      let filename: string;
+      const slug = project.slug || project.name;
+      switch (type) {
+        case 'zip':
+          blob = await exportZip(id);
+          filename = `${slug}.zip`;
+          break;
+        case 'desktop_mac':
+          blob = await exportDesktop(id, 'mac');
+          filename = `${slug}-mac.zip`;
+          break;
+        case 'desktop_windows':
+          blob = await exportDesktop(id, 'windows');
+          filename = `${slug}-windows.zip`;
+          break;
+        case 'mobile_android':
+          blob = await exportMobile(id, 'android');
+          filename = `${slug}-android.zip`;
+          break;
+        case 'mobile_ios':
+          blob = await exportMobile(id, 'ios');
+          filename = `${slug}-ios.zip`;
+          break;
+        case 'pwa':
+          blob = await exportPWA(id);
+          filename = `${slug}-pwa.zip`;
+          break;
+        default:
+          throw new Error('Unknown export type');
+      }
+      downloadBlob(blob, filename);
+      toast.success(`${type} exported!`);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
-      setIsExporting(false);
+      setIsExporting(null);
     }
   };
 
@@ -112,36 +225,24 @@ export function AppDetailsPage() {
     if (!id) return;
     setIsRestoring(true);
     try {
-      // Get files for this revision
       const { data: revFiles, error } = await supabase
-        .from('app_files')
-        .select('path, content, file_type')
-        .eq('project_id', id)
-        .eq('revision_id', revisionId);
-
+        .from('app_files').select('path, content, file_type')
+        .eq('project_id', id).eq('revision_id', revisionId);
       if (error) throw error;
-      if (!revFiles || revFiles.length === 0) {
-        toast.error('No files found for this revision');
-        return;
-      }
+      if (!revFiles?.length) { toast.error('No files found for this revision'); return; }
 
-      // Create a new revision for the restore
       const { count } = await supabase.from('app_revisions')
         .select('*', { count: 'exact', head: true }).eq('project_id', id);
 
       await supabase.from('app_revisions').insert({
-        project_id: id,
-        revision_number: (count || 0) + 1,
+        project_id: id, revision_number: (count || 0) + 1,
         change_summary: `Restored to revision #${revisionNumber}`,
         created_by: (await supabase.auth.getUser()).data.user!.id,
       });
 
-      // Update current files with revision's files
       for (const file of revFiles) {
-        await supabase.from('app_files')
-          .update({ content: file.content })
-          .eq('project_id', id)
-          .eq('path', file.path);
+        await supabase.from('app_files').update({ content: file.content })
+          .eq('project_id', id).eq('path', file.path);
       }
 
       toast.success(`Restored to revision #${revisionNumber}`);
@@ -160,20 +261,52 @@ export function AppDetailsPage() {
         supabase.from('app_files').select('path, content').eq('project_id', id!).eq('revision_id', revAId),
         supabase.from('app_files').select('path, content').eq('project_id', id!).eq('revision_id', revBId),
       ]);
-      setCompareRevisions({ a: revAId, b: revBId });
       setCompareFiles({ a: filesA || [], b: filesB || [] });
     } catch (err: any) {
       toast.error(err.message);
     }
   };
 
-  const handlePushGitHub = async () => {
-    if (!id) return;
+  const handleCreateRepo = async () => {
+    if (!id || !newRepoName.trim()) return;
+    setIsCreatingRepo(true);
     try {
-      const result = await pushToGitHub(id);
-      toast.success(`Pushed ${result.filesCount} files to ${result.repo}`);
+      const result = await createGitHubRepo(id, newRepoName.trim(), isRepoPrivate);
+      toast.success(`Created repo: ${result.repoFullName}`);
+      setNewRepoName('');
+      queryClient.invalidateQueries({ queryKey: ['project', id] });
     } catch (err: any) {
       toast.error(err.message);
+    } finally {
+      setIsCreatingRepo(false);
+    }
+  };
+
+  const handlePushGitHub = async () => {
+    if (!id) return;
+    setIsPushing(true);
+    try {
+      const result = await pushToGitHub(id, pushBranch);
+      toast.success(`Pushed ${result.filesCount} files to ${result.repo}@${result.branch} (${result.commitSha?.substring(0, 7)})`);
+      queryClient.invalidateQueries({ queryKey: ['build-logs', id] });
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setIsPushing(false);
+    }
+  };
+
+  const handleCreateBranch = async () => {
+    if (!id || !newBranchName.trim()) return;
+    setIsCreatingBranch(true);
+    try {
+      await createGitHubBranch(id, newBranchName.trim());
+      toast.success(`Created branch: ${newBranchName}`);
+      setNewBranchName('');
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setIsCreatingBranch(false);
     }
   };
 
@@ -190,6 +323,11 @@ export function AppDetailsPage() {
               <span className="text-2xl">{template?.icon || '📱'}</span>
               <h1 className="text-2xl font-bold text-foreground">{project.name}</h1>
               <Badge className={status.color}>{status.label}</Badge>
+              {canResume && (
+                <Button variant="outline" size="sm" onClick={handleResume} className="gap-1">
+                  <RefreshCw className="w-3 h-3" /> Resume
+                </Button>
+              )}
             </div>
             <p className="text-sm text-muted-foreground mt-1">{project.description}</p>
             <div className="flex gap-2 mt-2 text-xs text-muted-foreground">
@@ -198,6 +336,12 @@ export function AppDetailsPage() {
               <span>{AI_MODELS.find(m => m.value === project.selected_model)?.label || project.selected_model}</span>
               <span>•</span>
               <span>Updated {formatDistanceToNow(new Date(project.updated_at), { addSuffix: true })}</span>
+              {latestGen?.token_usage ? (
+                <>
+                  <span>•</span>
+                  <span>{latestGen.token_usage.toLocaleString()} tokens</span>
+                </>
+              ) : null}
             </div>
           </div>
         </div>
@@ -289,58 +433,46 @@ export function AppDetailsPage() {
           </Card>
         </TabsContent>
 
-        {/* Preview Tab */}
+        {/* Preview Tab — LIVE IFRAME */}
         <TabsContent value="preview">
           <Card className="shadow-card">
-            <CardContent className="p-6">
-              {files && files.length > 0 ? (
-                <div className="space-y-4">
-                  <h3 className="font-semibold text-foreground">Project Summary</h3>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="p-3 rounded-lg bg-muted">
-                      <div className="text-2xl font-bold text-foreground">{files.length}</div>
-                      <div className="text-xs text-muted-foreground">Files</div>
-                    </div>
-                    <div className="p-3 rounded-lg bg-muted">
-                      <div className="text-2xl font-bold text-foreground">{revisions?.length || 0}</div>
-                      <div className="text-xs text-muted-foreground">Revisions</div>
-                    </div>
-                    <div className="p-3 rounded-lg bg-muted">
-                      <div className="text-2xl font-bold text-foreground">{generations?.length || 0}</div>
-                      <div className="text-xs text-muted-foreground">Generations</div>
-                    </div>
-                    <div className="p-3 rounded-lg bg-muted">
-                      <div className="text-2xl font-bold text-foreground">{stack?.name || '-'}</div>
-                      <div className="text-xs text-muted-foreground">Stack</div>
-                    </div>
-                  </div>
-                  <h3 className="font-semibold text-foreground mt-4">Generated Pages</h3>
-                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                    {files.filter(f => f.path.includes('pages/') || f.path.endsWith('.html')).map(f => (
-                      <button key={f.id} onClick={() => setSelectedFile(f.path)}
-                        className="p-3 rounded-lg border text-left hover:border-primary/50 transition-colors">
-                        <div className="text-sm font-medium text-foreground">{f.path.split('/').pop()}</div>
-                        <div className="text-xs text-muted-foreground">{f.path}</div>
-                      </button>
-                    ))}
-                  </div>
-                  {generations?.[0]?.spec_json && (
-                    <div className="mt-4">
-                      <h3 className="font-semibold text-foreground mb-2">Project Spec</h3>
-                      <pre className="p-4 rounded-lg bg-muted text-xs font-mono text-foreground overflow-auto max-h-[300px]">
-                        {JSON.stringify(generations[0].spec_json, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                </div>
+            <CardContent className="p-0">
+              {previewHtml ? (
+                <iframe
+                  srcDoc={previewHtml}
+                  className="w-full border-0 rounded-lg"
+                  style={{ height: '600px' }}
+                  sandbox="allow-scripts allow-same-origin"
+                  title="App Preview"
+                />
               ) : (
-                <div className="text-center py-12">
+                <div className="text-center py-12 px-6">
                   <Eye className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
-                  <p className="text-muted-foreground">Generate your app to see the preview</p>
+                  <p className="text-muted-foreground">Generate your app to see the live preview</p>
                 </div>
               )}
             </CardContent>
           </Card>
+          {files && files.length > 0 && (
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+              <Card className="shadow-card p-3">
+                <div className="text-2xl font-bold text-foreground">{files.length}</div>
+                <div className="text-xs text-muted-foreground">Files</div>
+              </Card>
+              <Card className="shadow-card p-3">
+                <div className="text-2xl font-bold text-foreground">{revisions?.length || 0}</div>
+                <div className="text-xs text-muted-foreground">Revisions</div>
+              </Card>
+              <Card className="shadow-card p-3">
+                <div className="text-2xl font-bold text-foreground">{generations?.length || 0}</div>
+                <div className="text-xs text-muted-foreground">Generations</div>
+              </Card>
+              <Card className="shadow-card p-3">
+                <div className="text-2xl font-bold text-foreground">{latestGen?.token_usage?.toLocaleString() || '0'}</div>
+                <div className="text-xs text-muted-foreground">Tokens Used</div>
+              </Card>
+            </div>
+          )}
         </TabsContent>
 
         {/* Revisions Tab */}
@@ -351,9 +483,7 @@ export function AppDetailsPage() {
                 <CardTitle className="text-sm flex items-center gap-2">
                   <ArrowLeftRight className="w-4 h-4" /> Revision Comparison
                 </CardTitle>
-                <Button variant="ghost" size="sm" onClick={() => { setCompareFiles(null); setCompareRevisions(null); }}>
-                  Close
-                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setCompareFiles(null)}>Close</Button>
               </CardHeader>
               <CardContent className="p-4">
                 <div className="grid grid-cols-2 gap-4">
@@ -361,11 +491,11 @@ export function AppDetailsPage() {
                     <h4 className="text-xs font-medium text-muted-foreground mb-2">Older ({compareFiles.a.length} files)</h4>
                     <div className="space-y-1 max-h-[400px] overflow-auto">
                       {compareFiles.a.map((f, i) => {
-                        const matchB = compareFiles.b.find(fb => fb.path === f.path);
+                        const matchB = compareFiles.b.find((fb: any) => fb.path === f.path);
                         const changed = matchB && matchB.content !== f.content;
                         const removed = !matchB;
                         return (
-                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${removed ? 'bg-destructive/10 text-destructive' : changed ? 'bg-warning/10 text-warning' : 'text-muted-foreground'}`}>
+                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${removed ? 'bg-destructive/10 text-destructive' : changed ? 'bg-yellow-500/10 text-yellow-500' : 'text-muted-foreground'}`}>
                             {f.path} {removed ? '(removed)' : changed ? '(changed)' : ''}
                           </div>
                         );
@@ -376,11 +506,11 @@ export function AppDetailsPage() {
                     <h4 className="text-xs font-medium text-muted-foreground mb-2">Newer ({compareFiles.b.length} files)</h4>
                     <div className="space-y-1 max-h-[400px] overflow-auto">
                       {compareFiles.b.map((f, i) => {
-                        const matchA = compareFiles.a.find(fa => fa.path === f.path);
+                        const matchA = compareFiles.a.find((fa: any) => fa.path === f.path);
                         const isNew = !matchA;
                         const changed = matchA && matchA.content !== f.content;
                         return (
-                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${isNew ? 'bg-success/10 text-success' : changed ? 'bg-warning/10 text-warning' : 'text-muted-foreground'}`}>
+                          <div key={i} className={`text-xs p-1.5 rounded font-mono ${isNew ? 'bg-green-500/10 text-green-500' : changed ? 'bg-yellow-500/10 text-yellow-500' : 'text-muted-foreground'}`}>
                             {f.path} {isNew ? '(new)' : changed ? '(changed)' : ''}
                           </div>
                         );
@@ -419,7 +549,7 @@ export function AppDetailsPage() {
                             <AlertDialogContent>
                               <AlertDialogHeader>
                                 <AlertDialogTitle>Restore revision #{rev.revision_number}?</AlertDialogTitle>
-                                <AlertDialogDescription>This will restore all files to this revision's state and create a new revision.</AlertDialogDescription>
+                                <AlertDialogDescription>This will restore files and create a new revision.</AlertDialogDescription>
                               </AlertDialogHeader>
                               <AlertDialogFooter>
                                 <AlertDialogCancel>Cancel</AlertDialogCancel>
@@ -452,8 +582,8 @@ export function AppDetailsPage() {
                     {logs.map((log) => (
                       <div key={log.id} className={`p-2 rounded flex gap-2 ${
                         log.level === 'error' ? 'bg-destructive/10 text-destructive' :
-                        log.level === 'warning' ? 'bg-warning/10 text-warning' :
-                        log.level === 'success' ? 'bg-success/10 text-success' :
+                        log.level === 'warning' ? 'bg-yellow-500/10 text-yellow-500' :
+                        log.level === 'success' ? 'bg-green-500/10 text-green-500' :
                         'text-muted-foreground'
                       }`}>
                         <span className="opacity-50">[{new Date(log.created_at).toLocaleTimeString()}]</span>
@@ -476,107 +606,109 @@ export function AppDetailsPage() {
         {/* Export Tab */}
         <TabsContent value="export">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Card className="shadow-card">
-              <CardContent className="p-5">
-                <div className="flex items-center gap-3 mb-3">
-                  <Download className="w-6 h-6 text-primary" />
-                  <div>
-                    <h3 className="font-semibold text-foreground">Web App (ZIP)</h3>
-                    <p className="text-xs text-muted-foreground">Download source code as ZIP</p>
+            {[
+              { type: 'zip', icon: Download, title: 'Web App (ZIP)', desc: 'Download source code as ZIP' },
+              { type: 'desktop_mac', icon: Monitor, title: 'macOS Desktop', desc: 'Electron wrapper for macOS' },
+              { type: 'desktop_windows', icon: Monitor, title: 'Windows Desktop', desc: 'Electron wrapper for Windows' },
+              { type: 'mobile_android', icon: Smartphone, title: 'Android App', desc: 'Capacitor wrapper for Android' },
+              { type: 'mobile_ios', icon: Smartphone, title: 'iOS App', desc: 'Capacitor wrapper for iOS' },
+              { type: 'pwa', icon: Globe, title: 'Progressive Web App', desc: 'Service worker & manifest' },
+            ].map(({ type, icon: Icon, title, desc }) => (
+              <Card key={type} className="shadow-card">
+                <CardContent className="p-5">
+                  <div className="flex items-center gap-3 mb-3">
+                    <Icon className="w-6 h-6 text-primary" />
+                    <div>
+                      <h3 className="font-semibold text-foreground">{title}</h3>
+                      <p className="text-xs text-muted-foreground">{desc}</p>
+                    </div>
                   </div>
-                </div>
-                <Button onClick={handleExportZip} disabled={isExporting || !files?.length} className="w-full">
-                  {isExporting ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Download className="w-4 h-4 mr-2" />}
-                  Download ZIP
-                </Button>
-              </CardContent>
-            </Card>
-            <Card className="shadow-card">
-              <CardContent className="p-5">
-                <div className="flex items-center gap-3 mb-3">
-                  <Monitor className="w-6 h-6 text-primary" />
-                  <div>
-                    <h3 className="font-semibold text-foreground">Desktop App</h3>
-                    <p className="text-xs text-muted-foreground">Export with Electron wrapper</p>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'mac').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>macOS</Button>
-                  <Button variant="outline" className="flex-1" onClick={() => exportDesktop(id!, 'windows').then(() => toast.success('Desktop export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>Windows</Button>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="shadow-card">
-              <CardContent className="p-5">
-                <div className="flex items-center gap-3 mb-3">
-                  <Smartphone className="w-6 h-6 text-primary" />
-                  <div>
-                    <h3 className="font-semibold text-foreground">Mobile App</h3>
-                    <p className="text-xs text-muted-foreground">Export with Capacitor wrapper</p>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'android').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>Android</Button>
-                  <Button variant="outline" className="flex-1" onClick={() => exportMobile(id!, 'ios').then(() => toast.success('Mobile export ready')).catch(e => toast.error(e.message))} disabled={!files?.length}>iOS</Button>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="shadow-card">
-              <CardContent className="p-5">
-                <div className="flex items-center gap-3 mb-3">
-                  <Globe className="w-6 h-6 text-primary" />
-                  <div>
-                    <h3 className="font-semibold text-foreground">Progressive Web App</h3>
-                    <p className="text-xs text-muted-foreground">Add service worker & manifest</p>
-                  </div>
-                </div>
-                <Button variant="outline" className="w-full" onClick={() => exportPWA(id!).then(() => toast.success('PWA config added')).catch(e => toast.error(e.message))} disabled={!files?.length}>
-                  Generate PWA
-                </Button>
-              </CardContent>
-            </Card>
+                  <Button onClick={() => handleExport(type)} disabled={!!isExporting || !files?.length} className="w-full">
+                    {isExporting === type ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Download className="w-4 h-4 mr-2" />}
+                    Download
+                  </Button>
+                </CardContent>
+              </Card>
+            ))}
           </div>
         </TabsContent>
 
-        {/* GitHub Tab */}
+        {/* GitHub Tab — REAL */}
         <TabsContent value="github">
-          <Card className="shadow-card">
-            <CardContent className="p-6">
-              {project.github_connected ? (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-2">
-                    <GitBranch className="w-5 h-5 text-success" />
-                    <span className="font-medium text-foreground">Connected to GitHub</span>
-                  </div>
-                  {project.github_repo_url && (
-                    <a href={project.github_repo_url} target="_blank" rel="noopener noreferrer" className="text-sm text-primary hover:underline">
+          <div className="space-y-4">
+            {project.github_connected && project.github_repo_url ? (
+              <>
+                <Card className="shadow-card">
+                  <CardContent className="p-6 space-y-4">
+                    <div className="flex items-center gap-2">
+                      <GitBranch className="w-5 h-5 text-green-500" />
+                      <span className="font-medium text-foreground">Connected to GitHub</span>
+                    </div>
+                    <a href={project.github_repo_url} target="_blank" rel="noopener noreferrer" className="text-sm text-primary hover:underline block">
                       {project.github_repo_url}
                     </a>
-                  )}
-                  <div className="flex gap-2">
-                    <Button variant="outline" onClick={handlePushGitHub}>Push Changes</Button>
-                    <Button variant="outline">Create Branch</Button>
+
+                    {/* Push */}
+                    <div className="flex gap-2 items-end">
+                      <div className="flex-1">
+                        <Label className="text-xs text-muted-foreground">Branch</Label>
+                        <Input value={pushBranch} onChange={e => setPushBranch(e.target.value)} placeholder="main" />
+                      </div>
+                      <Button onClick={handlePushGitHub} disabled={isPushing}>
+                        {isPushing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <GitBranch className="w-4 h-4 mr-2" />}
+                        Push Changes
+                      </Button>
+                    </div>
+
+                    {/* Create branch */}
+                    <div className="flex gap-2 items-end">
+                      <div className="flex-1">
+                        <Label className="text-xs text-muted-foreground">New Branch Name</Label>
+                        <Input value={newBranchName} onChange={e => setNewBranchName(e.target.value)} placeholder="feature/my-feature" />
+                      </div>
+                      <Button variant="outline" onClick={handleCreateBranch} disabled={isCreatingBranch || !newBranchName.trim()}>
+                        {isCreatingBranch ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Plus className="w-4 h-4 mr-2" />}
+                        Create Branch
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </>
+            ) : (
+              <Card className="shadow-card">
+                <CardContent className="p-6 space-y-4">
+                  <div className="text-center mb-4">
+                    <GitBranch className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
+                    <h3 className="font-semibold text-foreground mb-1">Create a GitHub Repository</h3>
+                    <p className="text-sm text-muted-foreground">Push your generated code to GitHub</p>
                   </div>
-                </div>
-              ) : (
-                <div className="text-center py-8">
-                  <GitBranch className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
-                  <h3 className="font-semibold text-foreground mb-2">Connect to GitHub</h3>
-                  <p className="text-sm text-muted-foreground mb-4">Push your generated code to a GitHub repository</p>
-                  <Button className="gap-2" onClick={() => navigate('/app-builder/github')}>
-                    <GitBranch className="w-4 h-4" /> Go to GitHub Settings
+                  <div>
+                    <Label className="text-xs text-muted-foreground">Repository Name</Label>
+                    <Input value={newRepoName} onChange={e => setNewRepoName(e.target.value)}
+                      placeholder={project.slug || 'my-app'} />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Switch checked={isRepoPrivate} onCheckedChange={setIsRepoPrivate} id="private-repo" />
+                    <Label htmlFor="private-repo" className="text-sm">Private repository</Label>
+                  </div>
+                  <Button onClick={handleCreateRepo} disabled={isCreatingRepo || !newRepoName.trim()} className="w-full">
+                    {isCreatingRepo ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Plus className="w-4 h-4 mr-2" />}
+                    Create Repository & Push
                   </Button>
-                </div>
-              )}
-            </CardContent>
-          </Card>
+                  <p className="text-xs text-muted-foreground text-center">
+                    Make sure you've connected GitHub in the <button onClick={() => navigate('/app-builder/github')} className="text-primary hover:underline">GitHub Settings</button> page first.
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+          </div>
         </TabsContent>
       </Tabs>
     </div>
   );
 }
 
-// File tree helpers
+// ─── File tree helpers ───
 interface TreeNode {
   name: string;
   path: string;
