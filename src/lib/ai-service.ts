@@ -1,7 +1,5 @@
 import { supabase } from "@/integrations/supabase/client";
 
-const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/generate-app`;
-
 export interface GenerateSpecRequest {
   projectId: string;
   prompt: string;
@@ -60,12 +58,19 @@ export async function followUpEdit(projectId: string, generationId: string, prom
   return data;
 }
 
+export async function resumeGeneration(projectId: string, generationId: string): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.functions.invoke('generate-app', {
+    body: { action: 'resume_generation', projectId, generationId },
+  });
+  if (error) throw new Error(error.message || 'Failed to resume generation');
+  return data;
+}
+
 export async function exportZip(projectId: string): Promise<Blob> {
   const { data, error } = await supabase.functions.invoke('export-app', {
     body: { projectId, exportType: 'zip' },
   });
   if (error) throw new Error(error.message || 'Failed to export');
-  // Convert base64 to blob
   const binaryStr = atob(data.zipBase64);
   const bytes = new Uint8Array(binaryStr.length);
   for (let i = 0; i < binaryStr.length; i++) {
@@ -74,26 +79,41 @@ export async function exportZip(projectId: string): Promise<Blob> {
   return new Blob([bytes], { type: 'application/zip' });
 }
 
-export async function exportDesktop(projectId: string, platform: 'mac' | 'windows'): Promise<Record<string, unknown>> {
+export async function exportDesktop(projectId: string, platform: 'mac' | 'windows'): Promise<Blob> {
   const { data, error } = await supabase.functions.invoke('export-app', {
     body: { projectId, exportType: `desktop_${platform}` },
   });
   if (error) throw new Error(error.message || 'Failed to export desktop app');
-  return data;
+  const binaryStr = atob(data.zipBase64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: 'application/zip' });
 }
 
-export async function exportMobile(projectId: string, platform: 'android' | 'ios'): Promise<Record<string, unknown>> {
+export async function exportMobile(projectId: string, platform: 'android' | 'ios'): Promise<Blob> {
   const { data, error } = await supabase.functions.invoke('export-app', {
     body: { projectId, exportType: `mobile_${platform}` },
   });
   if (error) throw new Error(error.message || 'Failed to export mobile app');
-  return data;
+  const binaryStr = atob(data.zipBase64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: 'application/zip' });
 }
 
-export async function exportPWA(projectId: string): Promise<Record<string, unknown>> {
+export async function exportPWA(projectId: string): Promise<Blob> {
   const { data, error } = await supabase.functions.invoke('export-app', {
     body: { projectId, exportType: 'pwa' },
   });
   if (error) throw new Error(error.message || 'Failed to export PWA');
-  return data;
+  const binaryStr = atob(data.zipBase64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: 'application/zip' });
 }

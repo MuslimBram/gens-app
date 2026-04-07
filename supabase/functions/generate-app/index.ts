@@ -26,7 +26,12 @@ function resolveModel(model: string): string {
   return MODEL_MAP[model] || 'google/gemini-3-flash-preview';
 }
 
-async function callAI(prompt: string, systemPrompt: string, model: string): Promise<string> {
+interface AIResponse {
+  content: string;
+  tokenUsage: number;
+}
+
+async function callAI(prompt: string, systemPrompt: string, model: string): Promise<AIResponse> {
   const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
   if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
@@ -52,10 +57,12 @@ async function callAI(prompt: string, systemPrompt: string, model: string): Prom
   }
 
   const data = await response.json();
-  return data.choices?.[0]?.message?.content || "";
+  const content = data.choices?.[0]?.message?.content || "";
+  const tokenUsage = (data.usage?.prompt_tokens || 0) + (data.usage?.completion_tokens || 0);
+  return { content, tokenUsage };
 }
 
-async function callAIJSON(prompt: string, systemPrompt: string, model: string): Promise<any> {
+async function callAIJSON(prompt: string, systemPrompt: string, model: string): Promise<{ result: any; tokenUsage: number }> {
   const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
   if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
@@ -105,14 +112,35 @@ async function callAIJSON(prompt: string, systemPrompt: string, model: string): 
   }
 
   const data = await response.json();
+  const tokenUsage = (data.usage?.prompt_tokens || 0) + (data.usage?.completion_tokens || 0);
   const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
   if (toolCall?.function?.arguments) {
-    return JSON.parse(toolCall.function.arguments);
+    return { result: JSON.parse(toolCall.function.arguments), tokenUsage };
   }
   throw new Error("Failed to get structured output");
 }
 
-// Rate limiting: in-memory store
+// Retry wrapper with exponential backoff
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, label = "operation"): Promise<T> {
+  let lastError: Error = new Error("Unknown");
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      // Don't retry on non-transient errors
+      if (lastError.message.includes("Credits exhausted") || lastError.message.includes("usage policy")) throw lastError;
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise(r => setTimeout(r, delay));
+        console.log(`Retrying ${label} (attempt ${attempt + 2}/${maxRetries + 1})...`);
+      }
+    }
+  }
+  throw lastError;
+}
+
+// Rate limiting
 const genRateLimits = new Map<string, { count: number; resetAt: number }>();
 const GEN_RATE_LIMIT = 20;
 const GEN_RATE_WINDOW = 60_000;
@@ -129,6 +157,18 @@ function checkGenRateLimit(userId: string): boolean {
   return true;
 }
 
+// Helper to update generation with failure state
+async function failGeneration(supabase: any, genId: string, projectId: string, stage: string, error: string) {
+  await supabase.from("app_generations").update({
+    status: "failed", current_stage: stage, error_message: error,
+  }).eq("id", genId);
+  await supabase.from("app_projects").update({ status: "failed" }).eq("id", projectId);
+  await supabase.from("build_logs").insert({
+    project_id: projectId, generation_id: genId,
+    log_type: stage, message: `Failed: ${error}`, level: "error",
+  });
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -138,7 +178,6 @@ serve(async (req) => {
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Get user from token
     const token = authHeader.replace("Bearer ", "");
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
@@ -156,7 +195,7 @@ serve(async (req) => {
     const body = await req.json();
     const { action } = body;
 
-    // Prompt moderation for generation actions
+    // Prompt moderation
     if (action === "create_spec" || action === "follow_up_edit") {
       const prompt = body.prompt || "";
       const blockedPatterns = [
@@ -183,8 +222,7 @@ serve(async (req) => {
     if (action === "create_spec" || action === "follow_up_edit" || action === "export") {
       const quotaType = action === "create_spec" ? "generation" : action === "follow_up_edit" ? "follow_up" : "export";
       const { data: allowed } = await supabase.rpc("check_and_increment_quota", {
-        p_user_id: user.id,
-        p_action_type: quotaType,
+        p_user_id: user.id, p_action_type: quotaType,
       });
       if (allowed === false) {
         return new Response(JSON.stringify({ error: `Quota exceeded for ${quotaType}. Upgrade your plan for more.` }), {
@@ -193,63 +231,73 @@ serve(async (req) => {
       }
     }
 
-    // ACTION: CREATE SPEC
+    // ─── CREATE SPEC ───
     if (action === "create_spec") {
       const { projectId, prompt, model, template, stack, appType, options } = body;
 
-      // Create generation record
       const { data: gen, error: genErr } = await supabase.from("app_generations").insert({
-        project_id: projectId,
-        prompt,
-        model_name: model,
-        generation_mode: "initial",
-        status: "creating_spec",
-        current_stage: "creating_spec",
-        progress: 10,
+        project_id: projectId, prompt, model_name: model,
+        generation_mode: "initial", status: "creating_spec",
+        current_stage: "creating_spec", progress: 10,
       }).select().single();
       if (genErr) throw genErr;
 
-      // Update project status
       await supabase.from("app_projects").update({ status: "generating" }).eq("id", projectId);
 
-      // Log
       await supabase.from("build_logs").insert({
         project_id: projectId, generation_id: gen.id,
         log_type: "spec", message: "Starting spec generation...", level: "info",
       });
 
-      // Generate spec with AI
+      // Build enhanced prompt with Pulse AI integration
+      const integrationHints: string[] = [];
+      if (options?.addSupabase) integrationHints.push("Include Supabase integration with client setup and environment variables.");
+      if (options?.addAuth) integrationHints.push("Include authentication (login, signup, protected routes).");
+      if (options?.addAdmin) integrationHints.push("Include admin panel with role-based access.");
+      if (options?.addPayments) integrationHints.push("Include payment integration placeholder (Stripe-ready).");
+      if (options?.addPulseAI) integrationHints.push("Include Pulse AI integration: lead capture forms, CRM-ready contact forms, campaign landing page sections, analytics tracking hooks.");
+
       const specPrompt = `Create a detailed project specification for: "${prompt}"
 App Type: ${appType}, Template: ${template}, Stack: ${stack}
 Options: ${JSON.stringify(options)}
+${integrationHints.length ? "Integration requirements:\n" + integrationHints.join("\n") : ""}
 Generate a comprehensive spec with pages, features, file tree, and dependencies.`;
 
-      const spec = await callAIJSON(specPrompt, 
-        "You are a senior software architect. Create detailed project specifications for web applications. Be specific about pages, routes, features, and file structure.", 
-        model
-      );
+      try {
+        const { result: spec, tokenUsage } = await withRetry(
+          () => callAIJSON(specPrompt,
+            "You are a senior software architect. Create detailed project specifications for web applications. Be specific about pages, routes, features, and file structure. Include realistic file paths and proper dependency lists.",
+            model),
+          2, "spec_generation"
+        );
 
-      // Update generation with spec
-      await supabase.from("app_generations").update({
-        spec_json: spec, status: "generating_files", current_stage: "generating_files", progress: 30,
-      }).eq("id", gen.id);
+        await supabase.from("app_generations").update({
+          spec_json: spec, status: "generating_files", current_stage: "generating_files",
+          progress: 30, token_usage: tokenUsage,
+        }).eq("id", gen.id);
 
-      await supabase.from("build_logs").insert({
-        project_id: projectId, generation_id: gen.id,
-        log_type: "spec", message: `Spec generated: ${spec.pages?.length || 0} pages, ${spec.features?.length || 0} features`, level: "success",
-      });
+        await supabase.from("build_logs").insert({
+          project_id: projectId, generation_id: gen.id,
+          log_type: "spec",
+          message: `Spec generated: ${spec.pages?.length || 0} pages, ${spec.features?.length || 0} features (${tokenUsage} tokens)`,
+          level: "success",
+        });
 
-      // Track usage
-      await supabase.from("usage_tracking").insert({
-        user_id: user.id, action_type: "generation", project_id: projectId, model_used: model,
-      });
+        await supabase.from("usage_tracking").insert({
+          user_id: user.id, action_type: "generation", project_id: projectId,
+          model_used: model, token_usage: tokenUsage,
+        });
 
-      return new Response(JSON.stringify({ generationId: gen.id, spec }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+        return new Response(JSON.stringify({ generationId: gen.id, spec }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        await failGeneration(supabase, gen.id, projectId, "creating_spec", e instanceof Error ? e.message : "Unknown error");
+        throw e;
+      }
     }
 
-    // ACTION: GENERATE FILES
+    // ─── GENERATE FILES ───
     if (action === "generate_files") {
       const { projectId, generationId, spec, model, stack } = body;
 
@@ -260,30 +308,41 @@ Generate a comprehensive spec with pages, features, file tree, and dependencies.
 
       const fileTree = spec.file_tree || [];
       const generatedFiles: { path: string; content: string }[] = [];
+      let totalTokens = 0;
+      const failedFiles: string[] = [];
 
-      // Generate files based on spec
-      for (const filePath of fileTree) {
+      for (let i = 0; i < fileTree.length; i++) {
+        const filePath = fileTree[i];
+        const progress = 30 + Math.round((i / fileTree.length) * 40);
+
+        await supabase.from("app_generations").update({
+          progress, current_stage: `generating: ${filePath}`,
+        }).eq("id", generationId);
+
         const filePrompt = `Generate the complete code for file: ${filePath}
 Project spec: ${JSON.stringify(spec)}
 Stack: ${stack}
+Already generated files: ${generatedFiles.map(f => f.path).join(", ")}
 Generate production-ready code with proper imports, types, and structure. Return ONLY the file content, no markdown.`;
 
         try {
-          const content = await callAI(filePrompt,
-            "You are an expert developer. Generate clean, production-ready code for the specified file. Return only the code content without any markdown formatting or code blocks.",
-            model
+          const { content, tokenUsage } = await withRetry(
+            () => callAI(filePrompt,
+              "You are an expert developer. Generate clean, production-ready code for the specified file. Return only the code content without any markdown formatting or code blocks. Ensure imports reference other files in the project correctly.",
+              model),
+            2, `file:${filePath}`
           );
 
-          // Clean up any markdown code blocks
+          totalTokens += tokenUsage;
           const cleanContent = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
-
           generatedFiles.push({ path: filePath, content: cleanContent });
 
           await supabase.from("build_logs").insert({
             project_id: projectId, generation_id: generationId,
-            log_type: "generation", message: `Generated: ${filePath}`, level: "info",
+            log_type: "generation", message: `Generated: ${filePath} (${tokenUsage} tokens)`, level: "info",
           });
-        } catch (err) {
+        } catch (err: any) {
+          failedFiles.push(filePath);
           await supabase.from("build_logs").insert({
             project_id: projectId, generation_id: generationId,
             log_type: "generation", message: `Failed to generate: ${filePath} - ${err.message}`, level: "error",
@@ -315,22 +374,32 @@ Generate production-ready code with proper imports, types, and structure. Return
         });
       }
 
-      // Update generation
+      // Update generation with token usage
+      const status = failedFiles.length === 0 ? "reviewing" :
+                     failedFiles.length < fileTree.length ? "reviewing" : "failed";
+      
       await supabase.from("app_generations").update({
-        status: "reviewing", current_stage: "reviewing", progress: 70,
+        status, current_stage: status === "failed" ? "failed" : "reviewing",
+        progress: status === "failed" ? 0 : 70,
+        token_usage: totalTokens,
+        error_message: failedFiles.length ? `Failed files: ${failedFiles.join(", ")}` : null,
       }).eq("id", generationId);
 
       await supabase.from("build_logs").insert({
         project_id: projectId, generation_id: generationId,
-        log_type: "generation", message: `Generated ${generatedFiles.length} files`, level: "success",
+        log_type: "generation",
+        message: `Generated ${generatedFiles.length} files, ${failedFiles.length} failed (${totalTokens} total tokens)`,
+        level: failedFiles.length ? "warning" : "success",
       });
 
-      return new Response(JSON.stringify({ files: generatedFiles.length, revisionId: revision?.id }), {
+      return new Response(JSON.stringify({
+        files: generatedFiles.length, failedFiles, revisionId: revision?.id, totalTokens,
+      }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // ACTION: REVIEW FILES
+    // ─── REVIEW FILES ───
     if (action === "review_files") {
       const { projectId, generationId } = body;
 
@@ -342,26 +411,29 @@ Generate production-ready code with proper imports, types, and structure. Return
       const fileList = files.map(f => `${f.path}: ${f.content.substring(0, 200)}...`).join("\n");
       const reviewPrompt = `Review these project files for issues:\n${fileList}\n\nCheck for: missing imports, broken references, env vars, syntax issues, missing dependencies.`;
 
-      const reviewResult = await callAI(reviewPrompt,
-        "You are a code reviewer. Check for missing imports, broken file references, syntax issues, and missing dependencies. Be specific about each issue found.",
-        "auto"
+      const { content: reviewResult, tokenUsage } = await withRetry(
+        () => callAI(reviewPrompt,
+          "You are a code reviewer. Check for missing imports, broken file references, syntax issues, and missing dependencies. Be specific about each issue found.",
+          "auto"),
+        1, "review"
       );
 
       await supabase.from("build_logs").insert({
         project_id: projectId, generation_id: generationId,
-        log_type: "review", message: `Code review: ${reviewResult.substring(0, 500)}`, level: "info",
+        log_type: "review", message: `Code review (${tokenUsage} tokens): ${reviewResult.substring(0, 500)}`, level: "info",
       });
 
       await supabase.from("app_generations").update({
         status: "validating", current_stage: "validating", progress: 85,
+        token_usage: (await supabase.from("app_generations").select("token_usage").eq("id", generationId).single()).data?.token_usage + tokenUsage,
       }).eq("id", generationId);
 
-      return new Response(JSON.stringify({ review: reviewResult }), {
+      return new Response(JSON.stringify({ review: reviewResult, tokenUsage }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // ACTION: VALIDATE PROJECT
+    // ─── VALIDATE PROJECT ───
     if (action === "validate_project") {
       const { projectId, generationId } = body;
 
@@ -370,15 +442,13 @@ Generate production-ready code with proper imports, types, and structure. Return
 
       const issues: string[] = [];
 
-      // Check for package.json
       const pkgJson = files?.find(f => f.path === "package.json");
       if (!pkgJson) issues.push("Missing package.json");
 
-      // Check for README
       const readme = files?.find(f => f.path === "README.md");
       if (!readme) issues.push("Missing README.md");
 
-      // Check for imports matching file structure
+      // Check imports
       const filePaths = new Set(files?.map(f => f.path) || []);
       for (const file of files || []) {
         const imports = file.content.match(/from\s+['"]\.\/([^'"]+)['"]/g) || [];
@@ -410,32 +480,27 @@ Generate production-ready code with proper imports, types, and structure. Return
         level: issues.length === 0 ? "success" : "warning",
       });
 
-      // Update statuses
       await supabase.from("app_generations").update({
         status: "completed", build_status: buildStatus,
         current_stage: "completed", progress: 100,
       }).eq("id", generationId);
 
-      await supabase.from("app_projects").update({
-        status: "preview_ready",
-      }).eq("id", projectId);
+      await supabase.from("app_projects").update({ status: "preview_ready" }).eq("id", projectId);
 
       return new Response(JSON.stringify({ buildStatus, issues }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // ACTION: FOLLOW-UP EDIT
+    // ─── FOLLOW-UP EDIT ───
     if (action === "follow_up_edit") {
       const { projectId, generationId, prompt, model } = body;
 
-      // Get existing files
       const { data: existingFiles } = await supabase.from("app_files")
         .select("path, content").eq("project_id", projectId);
 
       const fileList = existingFiles?.map(f => `${f.path}:\n${f.content}`).join("\n---\n") || "";
 
-      // Create new generation
       const { data: newGen } = await supabase.from("app_generations").insert({
         project_id: projectId, prompt, model_name: model,
         generation_mode: "follow_up", status: "generating_files",
@@ -444,65 +509,100 @@ Generate production-ready code with proper imports, types, and structure. Return
 
       await supabase.from("app_projects").update({ status: "generating" }).eq("id", projectId);
 
-      // Ask AI to determine which files to modify
-      const editPrompt = `Current project files:\n${fileList}\n\nUser request: "${prompt}"\n\nDetermine which files need to be modified or created. For each file, provide the complete updated content. Return a JSON array of objects with "path" and "content" fields.`;
-
-      const editResult = await callAI(editPrompt,
-        "You are an expert developer. Given existing project files and an edit request, determine which files need changes. Return ONLY a JSON array of {\"path\": \"...\", \"content\": \"...\"} objects. No markdown, no explanation.",
-        model
-      );
-
-      let modifiedFiles: { path: string; content: string }[] = [];
       try {
-        const cleaned = editResult.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
-        modifiedFiles = JSON.parse(cleaned);
-      } catch {
-        modifiedFiles = [{ path: "EDIT_LOG.md", content: editResult }];
-      }
+        const editPrompt = `Current project files:\n${fileList}\n\nUser request: "${prompt}"\n\nDetermine which files need to be modified or created. For each file, provide the complete updated content. Return a JSON array of objects with "path" and "content" fields.`;
 
-      // Get revision count
-      const { count } = await supabase.from("app_revisions")
-        .select("*", { count: "exact", head: true }).eq("project_id", projectId);
+        const { content: editResult, tokenUsage } = await withRetry(
+          () => callAI(editPrompt,
+            "You are an expert developer. Given existing project files and an edit request, determine which files need changes. Return ONLY a JSON array of {\"path\": \"...\", \"content\": \"...\"} objects. No markdown, no explanation.",
+            model),
+          2, "follow_up_edit"
+        );
 
-      const { data: revision } = await supabase.from("app_revisions").insert({
-        project_id: projectId, generation_id: newGen?.id,
-        revision_number: (count || 0) + 1, change_summary: prompt,
-        created_by: user.id,
-      }).select().single();
-
-      // Update or insert files
-      for (const file of modifiedFiles) {
-        const existing = existingFiles?.find(f => f.path === file.path);
-        if (existing) {
-          await supabase.from("app_files").update({
-            content: file.content, revision_id: revision?.id,
-            generation_id: newGen?.id,
-          }).eq("project_id", projectId).eq("path", file.path);
-        } else {
-          await supabase.from("app_files").insert({
-            project_id: projectId, generation_id: newGen?.id,
-            revision_id: revision?.id, path: file.path, content: file.content,
-            file_type: file.path.split('.').pop() || 'txt',
-          });
+        let modifiedFiles: { path: string; content: string }[] = [];
+        try {
+          const cleaned = editResult.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+          modifiedFiles = JSON.parse(cleaned);
+        } catch {
+          modifiedFiles = [{ path: "EDIT_LOG.md", content: editResult }];
         }
+
+        const { count } = await supabase.from("app_revisions")
+          .select("*", { count: "exact", head: true }).eq("project_id", projectId);
+
+        const { data: revision } = await supabase.from("app_revisions").insert({
+          project_id: projectId, generation_id: newGen?.id,
+          revision_number: (count || 0) + 1, change_summary: prompt,
+          created_by: user.id,
+        }).select().single();
+
+        for (const file of modifiedFiles) {
+          const existing = existingFiles?.find(f => f.path === file.path);
+          if (existing) {
+            await supabase.from("app_files").update({
+              content: file.content, revision_id: revision?.id, generation_id: newGen?.id,
+            }).eq("project_id", projectId).eq("path", file.path);
+          } else {
+            await supabase.from("app_files").insert({
+              project_id: projectId, generation_id: newGen?.id,
+              revision_id: revision?.id, path: file.path, content: file.content,
+              file_type: file.path.split('.').pop() || 'txt',
+            });
+          }
+        }
+
+        await supabase.from("app_generations").update({
+          status: "completed", current_stage: "completed", progress: 100, token_usage: tokenUsage,
+        }).eq("id", newGen?.id);
+
+        await supabase.from("app_projects").update({ status: "preview_ready" }).eq("id", projectId);
+
+        await supabase.from("usage_tracking").insert({
+          user_id: user.id, action_type: "follow_up_edit", project_id: projectId,
+          model_used: model, token_usage: tokenUsage,
+        });
+
+        await supabase.from("build_logs").insert({
+          project_id: projectId, generation_id: newGen?.id,
+          log_type: "edit",
+          message: `Follow-up edit: modified ${modifiedFiles.length} file(s) (${tokenUsage} tokens)`,
+          level: "success",
+        });
+
+        return new Response(JSON.stringify({ files: modifiedFiles.length, revisionId: revision?.id, tokenUsage }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        if (newGen?.id) {
+          await failGeneration(supabase, newGen.id, projectId, "follow_up_edit", e instanceof Error ? e.message : "Unknown");
+        }
+        throw e;
       }
+    }
 
+    // ─── RESUME GENERATION ───
+    if (action === "resume_generation") {
+      const { projectId, generationId } = body;
+
+      const { data: gen } = await supabase.from("app_generations")
+        .select("*").eq("id", generationId).single();
+      if (!gen) throw new Error("Generation not found");
+      if (gen.status !== "failed") throw new Error("Only failed generations can be resumed");
+
+      // Reset to the failed stage
       await supabase.from("app_generations").update({
-        status: "completed", current_stage: "completed", progress: 100,
-      }).eq("id", newGen?.id);
+        status: gen.current_stage === "creating_spec" ? "creating_spec" : "generating_files",
+        error_message: null,
+      }).eq("id", generationId);
 
-      await supabase.from("app_projects").update({ status: "preview_ready" }).eq("id", projectId);
-
-      await supabase.from("usage_tracking").insert({
-        user_id: user.id, action_type: "follow_up_edit", project_id: projectId, model_used: model,
-      });
+      await supabase.from("app_projects").update({ status: "generating" }).eq("id", projectId);
 
       await supabase.from("build_logs").insert({
-        project_id: projectId, generation_id: newGen?.id,
-        log_type: "edit", message: `Follow-up edit: modified ${modifiedFiles.length} file(s)`, level: "success",
+        project_id: projectId, generation_id: generationId,
+        log_type: "resume", message: `Resuming generation from stage: ${gen.current_stage}`, level: "info",
       });
 
-      return new Response(JSON.stringify({ files: modifiedFiles.length, revisionId: revision?.id }), {
+      return new Response(JSON.stringify({ resumed: true, stage: gen.current_stage }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
