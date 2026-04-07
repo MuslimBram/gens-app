@@ -32,6 +32,14 @@ export async function pushToGitHub(projectId: string, branch = 'main') {
   return data;
 }
 
+export async function createGitHubBranch(projectId: string, branchName: string) {
+  const { data, error } = await supabase.functions.invoke('github-oauth', {
+    body: { action: 'create_branch', projectId, branchName },
+  });
+  if (error) throw new Error(error.message || 'Failed to create branch');
+  return data;
+}
+
 export async function disconnectGitHub() {
   const { data, error } = await supabase.functions.invoke('github-oauth', {
     body: { action: 'disconnect' },
