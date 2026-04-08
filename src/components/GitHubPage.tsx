@@ -46,7 +46,7 @@ export function GitHubPage() {
   const handleConnect = async () => {
     setIsConnecting(true);
     try {
-      const redirectUri = `${window.location.origin}/app-builder/github`;
+      const redirectUri = `https://gens-app.lovable.app/app-builder/github`;
       const { url } = await getGitHubAuthUrl(redirectUri);
       window.location.href = url;
     } catch (err: any) {
