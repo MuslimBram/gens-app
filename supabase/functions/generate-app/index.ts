@@ -589,22 +589,115 @@ Generate production-ready code with proper imports, types, and structure. Return
       if (!gen) throw new Error("Generation not found");
       if (gen.status !== "failed") throw new Error("Only failed generations can be resumed");
 
-      // Reset to the failed stage
-      await supabase.from("app_generations").update({
-        status: gen.current_stage === "creating_spec" ? "creating_spec" : "generating_files",
-        error_message: null,
-      }).eq("id", generationId);
-
       await supabase.from("app_projects").update({ status: "generating" }).eq("id", projectId);
-
       await supabase.from("build_logs").insert({
         project_id: projectId, generation_id: generationId,
-        log_type: "resume", message: `Resuming generation from stage: ${gen.current_stage}`, level: "info",
+        log_type: "resume", message: `Resuming from stage: ${gen.current_stage}`, level: "info",
       });
 
-      return new Response(JSON.stringify({ resumed: true, stage: gen.current_stage }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      const failedStage = gen.current_stage || "creating_spec";
+
+      try {
+        if (failedStage === "creating_spec") {
+          // Re-run spec generation
+          await supabase.from("app_generations").update({
+            status: "creating_spec", error_message: null, progress: 10,
+          }).eq("id", generationId);
+
+          const { result: spec, tokenUsage } = await withRetry(
+            () => callAIJSON(gen.prompt,
+              "You are a senior software architect. Create detailed project specifications for web applications. Be specific about pages, routes, features, and file structure.",
+              gen.model_name),
+            2, "resume_spec"
+          );
+
+          await supabase.from("app_generations").update({
+            spec_json: spec, status: "generating_files", current_stage: "generating_files",
+            progress: 30, token_usage: (gen.token_usage || 0) + tokenUsage, error_message: null,
+          }).eq("id", generationId);
+
+          await supabase.from("build_logs").insert({
+            project_id: projectId, generation_id: generationId,
+            log_type: "spec", message: `Spec regenerated (${tokenUsage} tokens)`, level: "success",
+          });
+
+          return new Response(JSON.stringify({ resumed: true, stage: "creating_spec", spec }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        if (failedStage === "generating_files" || failedStage.startsWith("generating:")) {
+          // Re-run file generation from where it left off
+          const spec = gen.spec_json as any;
+          if (!spec?.file_tree) throw new Error("No spec found. Please regenerate from scratch.");
+
+          await supabase.from("app_generations").update({
+            status: "generating_files", error_message: null, progress: 30,
+          }).eq("id", generationId);
+
+          // Check which files already exist
+          const { data: existingFiles } = await supabase.from("app_files")
+            .select("path").eq("project_id", projectId).eq("generation_id", generationId);
+          const existingPaths = new Set(existingFiles?.map(f => f.path) || []);
+
+          const fileTree: string[] = spec.file_tree;
+          const missingFiles = fileTree.filter(p => !existingPaths.has(p));
+          let totalTokens = 0;
+
+          for (let i = 0; i < missingFiles.length; i++) {
+            const filePath = missingFiles[i];
+            const progress = 30 + Math.round(((existingPaths.size + i) / fileTree.length) * 40);
+            await supabase.from("app_generations").update({
+              progress, current_stage: `generating: ${filePath}`,
+            }).eq("id", generationId);
+
+            const filePrompt = `Generate the complete code for file: ${filePath}\nProject spec: ${JSON.stringify(spec)}\nStack: ${spec.stack || "react-vite"}\nReturn ONLY the file content, no markdown.`;
+
+            const { content, tokenUsage } = await withRetry(
+              () => callAI(filePrompt,
+                "You are an expert developer. Generate clean, production-ready code. Return only code without markdown formatting.",
+                gen.model_name),
+              2, `resume_file:${filePath}`
+            );
+
+            totalTokens += tokenUsage;
+            const cleanContent = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+
+            await supabase.from("app_files").insert({
+              project_id: projectId, generation_id: generationId,
+              path: filePath, content: cleanContent,
+              file_type: filePath.split('.').pop() || 'txt',
+            });
+
+            await supabase.from("build_logs").insert({
+              project_id: projectId, generation_id: generationId,
+              log_type: "generation", message: `Resumed: ${filePath} (${tokenUsage} tokens)`, level: "info",
+            });
+          }
+
+          await supabase.from("app_generations").update({
+            status: "reviewing", current_stage: "reviewing", progress: 70,
+            token_usage: (gen.token_usage || 0) + totalTokens, error_message: null,
+          }).eq("id", generationId);
+
+          return new Response(JSON.stringify({ resumed: true, stage: "generating_files", resumedFiles: missingFiles.length, totalTokens }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        // For review/validate stages, just reset and let client re-call
+        await supabase.from("app_generations").update({
+          status: failedStage as any, error_message: null,
+          current_stage: failedStage,
+        }).eq("id", generationId);
+
+        return new Response(JSON.stringify({ resumed: true, stage: failedStage }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        await failGeneration(supabase, generationId, projectId, `resume_${failedStage}`, e instanceof Error ? e.message : "Unknown");
+        throw e;
+      }
     }
 
     return new Response(JSON.stringify({ error: "Unknown action" }), {
