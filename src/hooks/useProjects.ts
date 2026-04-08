@@ -151,7 +151,7 @@ export function useUpdateProject() {
     mutationFn: async ({ id, ...updates }: { id: string; [key: string]: any }) => {
       const { data, error } = await supabase
         .from('app_projects')
-        .update(updates)
+        .update(updates as any)
         .eq('id', id)
         .select()
         .single();
