@@ -121,7 +121,7 @@ export function GitHubPage() {
           <p>To enable GitHub integration, you need to configure a GitHub OAuth App:</p>
           <ol className="list-decimal list-inside space-y-1">
             <li>Go to GitHub → Settings → Developer settings → OAuth Apps</li>
-            <li>Create a new OAuth App with callback URL: <code className="bg-muted px-1 rounded">{window.location.origin}/app-builder/github</code></li>
+            <li>Create a new OAuth App with callback URL: <code className="bg-muted px-1 rounded">https://gens-app.lovable.app/app-builder/github</code></li>
             <li>Add <code className="bg-muted px-1 rounded">GITHUB_CLIENT_ID</code> and <code className="bg-muted px-1 rounded">GITHUB_CLIENT_SECRET</code> as backend secrets</li>
           </ol>
         </CardContent>
