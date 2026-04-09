@@ -33,7 +33,6 @@ import { formatDistanceToNow } from 'date-fns';
 function buildPreviewHtml(files: { path: string; content: string }[]): string {
   const indexHtml = files.find(f => f.path === 'index.html');
   if (indexHtml) {
-    // Inline CSS and JS into the HTML
     let html = indexHtml.content;
     const cssFiles = files.filter(f => f.path.endsWith('.css'));
     const jsFiles = files.filter(f => f.path.endsWith('.js') && f.path !== 'electron/main.cjs');
@@ -44,36 +43,103 @@ function buildPreviewHtml(files: { path: string; content: string }[]): string {
     return html;
   }
 
-  // For React/other projects, show a formatted code summary
+  // For React/TSX projects: render a rich interactive preview
   const cssFiles = files.filter(f => f.path.endsWith('.css'));
-  const componentFiles = files.filter(f => f.path.match(/\.(tsx|jsx)$/) && f.path.includes('/'));
+  const allFiles = files.filter(f => !f.path.endsWith('.md') && f.path !== '.env.example');
   const pageFiles = files.filter(f => f.path.includes('pages/') || f.path.includes('views/'));
+  const componentFiles = files.filter(f => f.path.match(/\.(tsx|jsx)$/) && !f.path.includes('pages/'));
+  const configFiles = files.filter(f => f.path.match(/(package\.json|tsconfig|vite\.config|tailwind)/));
+
+  // Extract route info from code
+  const routes: { path: string; component: string }[] = [];
+  for (const file of files) {
+    const routeMatches = file.content.matchAll(/path\s*[:=]\s*["']([^"']+)["']/g);
+    for (const m of routeMatches) {
+      if (m[1] && !routes.find(r => r.path === m[1])) {
+        routes.push({ path: m[1], component: file.path });
+      }
+    }
+  }
+
+  // Extract component names and their props
+  const components: { name: string; file: string; hasProps: boolean; linesOfCode: number }[] = [];
+  for (const file of [...pageFiles, ...componentFiles]) {
+    const fnMatch = file.content.match(/(?:export\s+(?:default\s+)?function|const)\s+(\w+)/);
+    const name = fnMatch?.[1] || file.path.split('/').pop()?.replace(/\.\w+$/, '') || 'Unknown';
+    const hasProps = file.content.includes('Props') || file.content.includes('props:');
+    components.push({ name, file: file.path, hasProps, linesOfCode: file.content.split('\n').length });
+  }
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; padding:24px; }
-  h1 { font-size:20px; margin-bottom:16px; color:#60a5fa; }
-  h2 { font-size:14px; margin:16px 0 8px; color:#94a3b8; text-transform:uppercase; letter-spacing:1px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
-  .card { background:#1e293b; border-radius:8px; padding:12px; border:1px solid #334155; }
-  .card h3 { font-size:13px; color:#f1f5f9; margin-bottom:4px; }
-  .card p { font-size:11px; color:#64748b; word-break:break-all; }
-  .stats { display:flex; gap:16px; margin-bottom:20px; }
-  .stat { background:#1e293b; border-radius:8px; padding:12px 16px; border:1px solid #334155; }
-  .stat .num { font-size:24px; font-weight:bold; color:#60a5fa; }
-  .stat .label { font-size:11px; color:#64748b; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; }
+  .header { padding:16px 24px; border-bottom:1px solid #1e293b; display:flex; align-items:center; gap:12px; }
+  .header h1 { font-size:18px; color:#60a5fa; }
+  .header .badge { background:#1e3a5f; color:#60a5fa; padding:2px 8px; border-radius:12px; font-size:11px; }
+  .tabs { display:flex; border-bottom:1px solid #1e293b; padding:0 24px; }
+  .tab { padding:10px 16px; font-size:13px; color:#64748b; cursor:pointer; border-bottom:2px solid transparent; }
+  .tab.active { color:#60a5fa; border-color:#60a5fa; }
+  .content { padding:24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:16px; }
+  .card { background:#1e293b; border-radius:12px; padding:16px; border:1px solid #334155; transition:border-color 0.2s; }
+  .card:hover { border-color:#60a5fa; }
+  .card h3 { font-size:14px; color:#f1f5f9; margin-bottom:6px; display:flex; align-items:center; gap:8px; }
+  .card p { font-size:12px; color:#64748b; }
+  .card .meta { display:flex; gap:12px; margin-top:8px; }
+  .card .meta span { font-size:11px; color:#475569; }
+  .stats { display:flex; gap:16px; margin-bottom:24px; flex-wrap:wrap; }
+  .stat { background:linear-gradient(135deg,#1e293b,#0f172a); border-radius:12px; padding:16px 20px; border:1px solid #334155; min-width:120px; }
+  .stat .num { font-size:28px; font-weight:bold; color:#60a5fa; }
+  .stat .label { font-size:11px; color:#64748b; margin-top:2px; }
+  .section-title { font-size:12px; color:#94a3b8; text-transform:uppercase; letter-spacing:1.5px; margin:20px 0 12px; }
+  .route-list { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:20px; }
+  .route { background:#1e293b; border:1px solid #334155; padding:6px 12px; border-radius:8px; font-size:12px; font-family:monospace; color:#34d399; }
+  .file-preview { background:#0d1117; border-radius:8px; padding:12px; font-family:monospace; font-size:11px; color:#8b949e; max-height:120px; overflow:hidden; position:relative; line-height:1.6; }
+  .file-preview::after { content:''; position:absolute; bottom:0; left:0; right:0; height:40px; background:linear-gradient(transparent,#1e293b); }
+  .tag { background:#1e3a5f; color:#60a5fa; padding:2px 6px; border-radius:4px; font-size:10px; }
   ${cssFiles.map(f => f.content).join('\n')}
 </style></head><body>
-  <h1>📱 Project Preview</h1>
-  <div class="stats">
-    <div class="stat"><div class="num">${files.length}</div><div class="label">Files</div></div>
-    <div class="stat"><div class="num">${pageFiles.length}</div><div class="label">Pages</div></div>
-    <div class="stat"><div class="num">${componentFiles.length}</div><div class="label">Components</div></div>
+  <div class="header">
+    <span style="font-size:24px">⚡</span>
+    <h1>Project Preview</h1>
+    <span class="badge">React</span>
+    <span class="badge">${allFiles.length} files</span>
   </div>
-  ${pageFiles.length ? `<h2>Pages</h2><div class="grid">${pageFiles.map(f => `<div class="card"><h3>${f.path.split('/').pop()}</h3><p>${f.path}</p></div>`).join('')}</div>` : ''}
-  ${componentFiles.length ? `<h2>Components</h2><div class="grid">${componentFiles.map(f => `<div class="card"><h3>${f.path.split('/').pop()}</h3><p>${f.path}</p></div>`).join('')}</div>` : ''}
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('overview')">Overview</div>
+    <div class="tab" onclick="showTab('components')">Components</div>
+    <div class="tab" onclick="showTab('code')">Code Preview</div>
+  </div>
+  <div class="content" id="tab-overview">
+    <div class="stats">
+      <div class="stat"><div class="num">${allFiles.length}</div><div class="label">Total Files</div></div>
+      <div class="stat"><div class="num">${pageFiles.length}</div><div class="label">Pages</div></div>
+      <div class="stat"><div class="num">${componentFiles.length}</div><div class="label">Components</div></div>
+      <div class="stat"><div class="num">${routes.length}</div><div class="label">Routes</div></div>
+      <div class="stat"><div class="num">${allFiles.reduce((s,f) => s + f.content.split('\\n').length, 0).toLocaleString()}</div><div class="label">Lines of Code</div></div>
+    </div>
+    ${routes.length ? `<div class="section-title">🗺️ Routes</div><div class="route-list">${routes.map(r => `<div class="route">${r.path}</div>`).join('')}</div>` : ''}
+    ${pageFiles.length ? `<div class="section-title">📄 Pages</div><div class="grid">${pageFiles.map(f => {
+      const comp = components.find(c => c.file === f.path);
+      return `<div class="card"><h3>${comp?.name || f.path.split('/').pop()?.replace(/\.\w+$/,'')}<span class="tag">page</span></h3><p>${f.path}</p><div class="meta"><span>${f.content.split('\\n').length} lines</span>${comp?.hasProps ? '<span>Has props</span>' : ''}</div></div>`;
+    }).join('')}</div>` : ''}
+  </div>
+  <div class="content" id="tab-components" style="display:none">
+    <div class="grid">${components.map(c => `<div class="card"><h3>${c.name}<span class="tag">${c.file.includes('pages/') ? 'page' : 'component'}</span></h3><p>${c.file}</p><div class="meta"><span>${c.linesOfCode} lines</span>${c.hasProps ? '<span>Accepts props</span>' : ''}</div></div>`).join('')}</div>
+  </div>
+  <div class="content" id="tab-code" style="display:none">
+    <div class="grid">${allFiles.slice(0, 8).map(f => `<div class="card"><h3>${f.path.split('/').pop()}</h3><p>${f.path}</p><div class="file-preview">${f.content.substring(0, 300).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div></div>`).join('')}</div>
+  </div>
+  <script>
+    function showTab(name) {
+      document.querySelectorAll('[id^=tab-]').forEach(el => el.style.display = 'none');
+      document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+      document.getElementById('tab-' + name).style.display = 'block';
+      event.target.classList.add('active');
+    }
+  <\/script>
 </body></html>`;
 }
 
