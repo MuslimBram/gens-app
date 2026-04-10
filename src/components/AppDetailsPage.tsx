@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, lazy, Suspense } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useProject, useProjectFiles, useProjectGenerations, useProjectRevisions, useBuildLogs, useUpdateProject, useDeleteProject } from '@/hooks/useProjects';
 import { followUpEdit, exportZip, exportDesktop, exportMobile, exportPWA, resumeGeneration } from '@/lib/ai-service';
@@ -28,6 +28,7 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger
 } from '@/components/ui/alert-dialog';
 import { formatDistanceToNow } from 'date-fns';
+import { SandpackPreview } from '@/components/SandpackPreview';
 
 // ─── Live Preview: builds an HTML document from generated files ───
 function buildPreviewHtml(files: { path: string; content: string }[]): string {
@@ -499,18 +500,31 @@ export function AppDetailsPage() {
           </Card>
         </TabsContent>
 
-        {/* Preview Tab — LIVE IFRAME */}
+        {/* Preview Tab — LIVE SANDPACK / IFRAME */}
         <TabsContent value="preview">
           <Card className="shadow-card">
             <CardContent className="p-0">
-              {previewHtml ? (
-                <iframe
-                  srcDoc={previewHtml}
-                  className="w-full border-0 rounded-lg"
-                  style={{ height: '600px' }}
-                  sandbox="allow-scripts allow-same-origin"
-                  title="App Preview"
-                />
+              {files && files.length > 0 ? (
+                files.some(f => f.path.match(/\.(tsx|jsx)$/)) ? (
+                  <Suspense fallback={
+                    <div className="flex items-center justify-center h-[600px]">
+                      <Loader2 className="w-8 h-8 animate-spin text-primary" />
+                    </div>
+                  }>
+                    <SandpackPreview
+                      files={files.map(f => ({ path: f.path, content: f.content }))}
+                      stackKey={project.stack_key}
+                    />
+                  </Suspense>
+                ) : previewHtml ? (
+                  <iframe
+                    srcDoc={previewHtml}
+                    className="w-full border-0 rounded-lg"
+                    style={{ height: '600px' }}
+                    sandbox="allow-scripts allow-same-origin"
+                    title="App Preview"
+                  />
+                ) : null
               ) : (
                 <div className="text-center py-12 px-6">
                   <Eye className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
