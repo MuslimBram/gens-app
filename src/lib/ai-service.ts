@@ -18,11 +18,24 @@ export interface GenerateFilesRequest {
   stack: string;
 }
 
+async function extractError(error: any, data: any, fallback: string): Promise<string> {
+  // supabase.functions.invoke puts the response body in data even on error
+  if (data?.error) return data.error;
+  if (error?.message) return error.message;
+  if (error?.context?.body) {
+    try {
+      const body = typeof error.context.body === 'string' ? JSON.parse(error.context.body) : error.context.body;
+      if (body?.error) return body.error;
+    } catch {}
+  }
+  return fallback;
+}
+
 export async function generateSpec(req: GenerateSpecRequest): Promise<Record<string, unknown>> {
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'create_spec', ...req },
   });
-  if (error) throw new Error(error.message || 'Failed to generate spec');
+  if (error) throw new Error(await extractError(error, data, 'Failed to generate spec'));
   return data;
 }
 
@@ -30,7 +43,7 @@ export async function generateFiles(req: GenerateFilesRequest): Promise<Record<s
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'generate_files', ...req },
   });
-  if (error) throw new Error(error.message || 'Failed to generate files');
+  if (error) throw new Error(await extractError(error, data, 'Failed to generate files'));
   return data;
 }
 
@@ -38,7 +51,7 @@ export async function reviewFiles(projectId: string, generationId: string): Prom
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'review_files', projectId, generationId },
   });
-  if (error) throw new Error(error.message || 'Failed to review files');
+  if (error) throw new Error(await extractError(error, data, 'Failed to review files'));
   return data;
 }
 
@@ -46,7 +59,7 @@ export async function validateProject(projectId: string, generationId: string): 
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'validate_project', projectId, generationId },
   });
-  if (error) throw new Error(error.message || 'Failed to validate project');
+  if (error) throw new Error(await extractError(error, data, 'Failed to validate project'));
   return data;
 }
 
@@ -54,7 +67,7 @@ export async function followUpEdit(projectId: string, generationId: string, prom
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'follow_up_edit', projectId, generationId, prompt, model },
   });
-  if (error) throw new Error(error.message || 'Failed to edit project');
+  if (error) throw new Error(await extractError(error, data, 'Failed to edit project'));
   return data;
 }
 
@@ -62,7 +75,7 @@ export async function resumeGeneration(projectId: string, generationId: string):
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'resume_generation', projectId, generationId },
   });
-  if (error) throw new Error(error.message || 'Failed to resume generation');
+  if (error) throw new Error(await extractError(error, data, 'Failed to resume generation'));
   return data;
 }
 

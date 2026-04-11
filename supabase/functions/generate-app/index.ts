@@ -703,9 +703,13 @@ Generate production-ready code with proper imports, types, and structure. Return
     return new Response(JSON.stringify({ error: "Unknown action" }), {
       status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
-  } catch (e) {
-    console.error("generate-app error:", e);
-    return new Response(JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }), {
+  } catch (e: unknown) {
+    const errMsg = e instanceof Error ? e.message
+      : (e && typeof e === "object" && "message" in e) ? String((e as any).message)
+      : typeof e === "string" ? e
+      : JSON.stringify(e);
+    console.error("generate-app error:", errMsg, e);
+    return new Response(JSON.stringify({ error: errMsg || "Internal server error" }), {
       status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
