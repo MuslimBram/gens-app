@@ -18,11 +18,24 @@ export interface GenerateFilesRequest {
   stack: string;
 }
 
+async function extractError(error: any, data: any, fallback: string): Promise<string> {
+  // supabase.functions.invoke puts the response body in data even on error
+  if (data?.error) return data.error;
+  if (error?.message) return error.message;
+  if (error?.context?.body) {
+    try {
+      const body = typeof error.context.body === 'string' ? JSON.parse(error.context.body) : error.context.body;
+      if (body?.error) return body.error;
+    } catch {}
+  }
+  return fallback;
+}
+
 export async function generateSpec(req: GenerateSpecRequest): Promise<Record<string, unknown>> {
   const { data, error } = await supabase.functions.invoke('generate-app', {
     body: { action: 'create_spec', ...req },
   });
-  if (error) throw new Error(error.message || 'Failed to generate spec');
+  if (error) throw new Error(await extractError(error, data, 'Failed to generate spec'));
   return data;
 }
 
