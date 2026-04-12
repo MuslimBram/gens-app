@@ -33,7 +33,7 @@ export function SettingsPage() {
   const periodEnd = userPlan?.period_end ? new Date(userPlan.period_end).toLocaleDateString() : '-';
 
   const handleUpgrade = (planKey: string) => {
-    toast.info(`Plan upgrade to ${planKey} coming soon! Contact support for early access.`);
+    toast.info(`PayPal integration coming soon for ${planKey} plan. Stay tuned!`);
   };
 
   return (
