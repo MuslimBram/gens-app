@@ -175,20 +175,158 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 
     if (exportType === "mobile_android" || exportType === "mobile_ios") {
       const platform = exportType === "mobile_android" ? "android" : "ios";
+      const safeId = `com.pulseai.app${projectId.replace(/-/g, "").slice(0, 16)}`;
       const mobileFiles = [...files];
+
       mobileFiles.push({
         path: "capacitor.config.ts",
         content: `import type { CapacitorConfig } from '@capacitor/cli';
 const config: CapacitorConfig = {
-  appId: 'com.pulseai.generated',
+  appId: '${safeId}',
   appName: 'Generated App',
   webDir: 'dist',
 };
-export default config;`,
+export default config;
+`,
       });
+
+      // GitHub Actions workflow that produces a REAL APK / AAB / iOS archive on push
+      if (platform === "android") {
+        mobileFiles.push({
+          path: ".github/workflows/android-build.yml",
+          content: `name: Android Build (APK + AAB)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Capacitor
+        run: npm install @capacitor/core @capacitor/cli @capacitor/android
+
+      - name: Build web assets
+        run: npm run build
+
+      - name: Add Android platform
+        run: npx cap add android || npx cap sync android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Build APK (debug)
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Build AAB (release unsigned)
+        working-directory: android
+        run: ./gradlew bundleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
+`,
+        });
+      } else {
+        mobileFiles.push({
+          path: ".github/workflows/ios-build.yml",
+          content: `name: iOS Build (unsigned archive)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Capacitor
+        run: npm install @capacitor/core @capacitor/cli @capacitor/ios
+
+      - name: Build web assets
+        run: npm run build
+
+      - name: Add iOS platform
+        run: npx cap add ios || npx cap sync ios
+
+      - name: Sync Capacitor
+        run: npx cap sync ios
+
+      - name: Build unsigned archive
+        working-directory: ios/App
+        run: |
+          pod install
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release -sdk iphoneos -archivePath build/App.xcarchive archive CODE_SIGNING_ALLOWED=NO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-archive
+          path: ios/App/build/App.xcarchive
+`,
+        });
+      }
+
       mobileFiles.push({
         path: "BUILD_INSTRUCTIONS.md",
-        content: `# Mobile App Build Instructions (${platform})\n\n## Prerequisites\n- Node.js 18+\n- ${platform === "android" ? "Android Studio" : "Xcode (macOS only)"}\n\n## Steps\n1. \`npm install\`\n2. \`npm install @capacitor/core @capacitor/cli @capacitor/${platform}\`\n3. \`npx cap init\`\n4. \`npm run build\`\n5. \`npx cap add ${platform}\`\n6. \`npx cap sync\`\n7. \`npx cap run ${platform}\``,
+        content: `# Mobile Build Pipeline (${platform})
+
+This project ships with a **real CI/CD pipeline** — no need to install Android Studio${platform === "ios" ? " or Xcode" : ""} locally.
+
+## Option A — Automatic build via GitHub Actions (recommended)
+
+1. Create a new GitHub repo and push this folder to it.
+2. Go to your repo → **Actions** tab → enable workflows.
+3. Every push to \`main\` triggers \`.github/workflows/${platform}-build.yml\` and produces:
+${platform === "android" ? "   - **app-debug.apk** (installable on any Android device)\n   - **app-release.aab** (uploadable to Google Play, needs signing for production)" : "   - **App.xcarchive** (unsigned — sign with your Apple Developer account to publish)"}
+4. Download artifacts from the **Actions** run page.
+
+${platform === "android" ? `## Signing the AAB for Google Play
+
+\`\`\`bash
+keytool -genkey -v -keystore release.keystore -alias app -keyalg RSA -keysize 2048 -validity 10000
+jarsigner -keystore release.keystore app-release.aab app
+\`\`\`
+` : ""}
+## Option B — Local build
+
+1. \`npm install\`
+2. \`npm install @capacitor/core @capacitor/cli @capacitor/${platform}\`
+3. \`npm run build\`
+4. \`npx cap add ${platform}\`
+5. \`npx cap sync\`
+6. \`npx cap open ${platform}\` → build & run from ${platform === "android" ? "Android Studio" : "Xcode"}
+`,
       });
 
       const zipBytes = createZip(mobileFiles);
