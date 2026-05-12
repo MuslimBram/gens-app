@@ -257,19 +257,57 @@ serve(async (req) => {
       if (options?.addPayments) integrationHints.push("Include payment integration placeholder (Stripe-ready).");
       if (options?.addPulseAI) integrationHints.push("Include Pulse AI integration: lead capture forms, CRM-ready contact forms, campaign landing page sections, analytics tracking hooks.");
 
-      const specPrompt = `Create a detailed project specification for: "${prompt}"
+      const stackRules = stack === 'static-html' ? `
+STATIC HTML STACK RULES (STRICT):
+- Use ONLY: index.html, styles.css, script.js, assets/ folder
+- NO src/, NO package.json, NO React, NO build tooling
+- index.html must include real semantic content reflecting the user's idea (multiple sections, real copy, real images via picsum.photos)
+` : stack === 'next' ? `
+NEXT.JS STACK RULES (STRICT):
+- Use App Router: app/layout.tsx, app/page.tsx, app/<route>/page.tsx
+- components/ folder for shared components
+- Single package.json at root, single tailwind.config.ts, single tsconfig.json
+- NO duplicate App.js or pages/ folder
+` : `
+REACT + VITE STACK RULES (STRICT):
+- ALL source code lives under src/ ONLY. NEVER place App.js, App.jsx, index.js, styles.css, README.md duplicates at the root.
+- Required root files (exactly these, no duplicates): package.json, vite.config.js, index.html, .gitignore, README.md, .env.example (only if env_vars exist)
+- Required src files: src/main.jsx, src/App.jsx, src/index.css
+- Pages go under src/pages/, components under src/components/
+- Use .jsx (NOT .tsx) unless options.useTypescript is true
+- Tailwind via CDN in index.html OR proper tailwind config — pick one and be consistent
+`;
+
+      const specPrompt = `USER'S APP IDEA (source of truth — every page and feature MUST reflect this):
+"""
+${prompt}
+"""
+
 App Type: ${appType}, Template: ${template}, Stack: ${stack}
 Options: ${JSON.stringify(options)}
 ${integrationHints.length ? "Integration requirements:\n" + integrationHints.join("\n") : ""}
-Generate a comprehensive spec with pages, features, file tree, and dependencies.`;
+${stackRules}
+
+Build a spec where:
+- app_name reflects the user's idea (NOT a generic name)
+- pages are specific to the user's domain (NOT generic Home/About unless asked)
+- features list real domain features from the prompt
+- file_tree contains 8-20 files, NO duplicates, NO placeholder files
+- dependencies are real npm package names actually needed
+Return via the tool call.`;
 
       try {
         const { result: spec, tokenUsage } = await withRetry(
           () => callAIJSON(specPrompt,
-            "You are a senior software architect. Create detailed project specifications for web applications. Be specific about pages, routes, features, and file structure. Include realistic file paths and proper dependency lists.",
+            `You are a senior software architect generating production-ready project specs. CRITICAL RULES: (1) Never invent duplicate files at root and src/ — pick ONE canonical location per the stack rules. (2) Every page and feature MUST be specifically derived from the user's prompt — no generic boilerplate. (3) file_tree must be a clean, deduplicated list of unique paths only. (4) Stack: ${stack} — follow its conventions strictly.`,
             model),
           2, "spec_generation"
         );
+
+        // Dedupe and sanitize file_tree
+        if (Array.isArray(spec.file_tree)) {
+          spec.file_tree = Array.from(new Set(spec.file_tree.filter((p: any) => typeof p === 'string' && p.trim().length > 0)));
+        }
 
         await supabase.from("app_generations").update({
           spec_json: spec, status: "generating_files", current_stage: "generating_files",
