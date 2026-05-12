@@ -349,6 +349,9 @@ Return via the tool call.`;
       let totalTokens = 0;
       const failedFiles: string[] = [];
 
+      const userIdea = (spec.goal as string) || '';
+      const appName = (spec.app_name as string) || 'App';
+
       for (let i = 0; i < fileTree.length; i++) {
         const filePath = fileTree[i];
         const progress = 30 + Math.round((i / fileTree.length) * 40);
@@ -357,22 +360,44 @@ Return via the tool call.`;
           progress, current_stage: `generating: ${filePath}`,
         }).eq("id", generationId);
 
-        const filePrompt = `Generate the complete code for file: ${filePath}
-Project spec: ${JSON.stringify(spec)}
+        const filePrompt = `USER'S APP IDEA (build REAL content for this — NEVER use "Hello world" or generic placeholders):
+"""
+${userIdea}
+"""
+
+App name: ${appName}
+File to generate: ${filePath}
 Stack: ${stack}
-Already generated files: ${generatedFiles.map(f => f.path).join(", ")}
-Generate production-ready code with proper imports, types, and structure. Return ONLY the file content, no markdown.`;
+Full project spec: ${JSON.stringify(spec)}
+Already generated files in this project: ${generatedFiles.map(f => f.path).join(", ") || "(none yet)"}
+
+REQUIREMENTS:
+- Generate the COMPLETE, PRODUCTION-READY content for ${filePath}
+- Content MUST reflect the user's actual app idea above (real copy, real domain logic, real components)
+- For UI files: include real sections, real text in the user's language, real images (use https://picsum.photos/seed/<word>/800/600 for placeholders)
+- For React entry (main.jsx/index.jsx): mount <App /> from "./App"
+- Imports MUST match other files in the project (check the "already generated" list)
+- NEVER output "Hello world", "Lorem ipsum", "TODO", "Coming soon" as the only content
+- Return ONLY the raw file content. NO markdown fences, NO explanations.`;
 
         try {
           const { content, tokenUsage } = await withRetry(
             () => callAI(filePrompt,
-              "You are an expert developer. Generate clean, production-ready code for the specified file. Return only the code content without any markdown formatting or code blocks. Ensure imports reference other files in the project correctly.",
+              `You are an expert full-stack developer. You generate complete, production-quality file content tailored to the user's specific app idea. NEVER produce placeholder content like "Hello world", "TODO", or empty stubs. Every file you produce must be real, working code that fits the project. Output ONLY the raw file content with no markdown formatting.`,
               model),
             2, `file:${filePath}`
           );
 
           totalTokens += tokenUsage;
-          const cleanContent = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+          let cleanContent = content.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+
+          // Reject obvious placeholder content for source/UI files
+          const isSourceFile = /\.(jsx?|tsx?|html|vue|svelte)$/.test(filePath);
+          const looksLikePlaceholder = isSourceFile && cleanContent.length < 120 && /hello\s*world/i.test(cleanContent);
+          if (looksLikePlaceholder) {
+            throw new Error("AI returned placeholder content");
+          }
+
           generatedFiles.push({ path: filePath, content: cleanContent });
 
           await supabase.from("build_logs").insert({
